@@ -1,6 +1,6 @@
 import SimpleITK as sitk
 import os
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 import numpy as np
 import xml.etree.ElementTree as ET
 
@@ -125,55 +125,86 @@ def create_nodule_mask(xml_path: str, original_image: sitk.Image, resampled_imag
 
 
 
-def main():
-    # --- DICOMデータの読み込み ---
-    dicom_dir = r'data\manifest-1752629384107\LIDC-IDRI\LIDC-IDRI-0001\01-01-2000-NA-NA-30178\3000566.000000-NA-03192'
-    xml_path = os.path.join(dicom_dir, '069.xml')
+# --- データセット作成のための関数 ---
+def create_bev_target(nodule_mask_3d: sitk.Image) -> sitk.Image:
+    """
+    3D結節マスクからBEVターゲットを生成する。
+    Z軸方向に積分することで実現する。
+    """
+    print("BEVターゲットの生成中...")
+
+    projector = sitk.SumProjectionImageFilter()
+    projector.SetProjectionDimension(0)
+    bev_image = projector.Execute(nodule_mask_3d)
+
+    print(f"BEVターゲットの生成完了")
+    return bev_image
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# def main():
+#     # --- DICOMデータの読み込み ---
+#     dicom_dir = r'data\manifest-1752629384107\LIDC-IDRI\LIDC-IDRI-0001\01-01-2000-NA-NA-30178\3000566.000000-NA-03192'
+#     xml_path = os.path.join(dicom_dir, '069.xml')
     
-    if not os.path.isdir(dicom_dir):
-        print(f"エラー: ディレクトリが存在しません: {dicom_dir}")
-        return
+#     if not os.path.isdir(dicom_dir):
+#         print(f"エラー: ディレクトリが存在しません: {dicom_dir}")
+#         return
 
-    reader = sitk.ImageSeriesReader()
-    dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir)
-    reader.SetFileNames(dicom_names)
-    original_image = reader.Execute()
-    resampled_image = resample_image_to_isotropic(original_image)
+#     reader = sitk.ImageSeriesReader()
+#     dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir)
+#     reader.SetFileNames(dicom_names)
+#     original_image = reader.Execute()
+#     resampled_image = resample_image_to_isotropic(original_image)
 
-    # --- 結節マスクの作成 ---
-    nodule_mask_3d = create_nodule_mask(xml_path, original_image, resampled_image)
+#     # --- 結節マスクの作成 ---
+#     nodule_mask_3d = create_nodule_mask(xml_path, original_image, resampled_image)
 
-    # DRRとマスクDRRの生成
-    # CT画像のDRRを生成（デフォルト値は-1000, 補間は線形）
-    drr_frontal = generate_drr(resampled_image, 0, 0, 0)
-    drr_rotated_x = generate_drr(resampled_image, rotation_x_rad=np.deg2rad(30))
+#     # DRRとマスクDRRの生成
+#     # CT画像のDRRを生成（デフォルト値は-1000, 補間は線形）
+#     drr_frontal = generate_drr(resampled_image, 0, 0, 0)
+#     drr_rotated_x = generate_drr(resampled_image, rotation_x_rad=np.deg2rad(30))
     
-    # マスク画像のDRRを生成（デフォルト値は0, 補間は最近傍法）
-    mask_frontal = generate_drr(nodule_mask_3d, 0, 0, 0, 
-                                default_pixel_value=0, interpolator=sitk.sitkNearestNeighbor)
-    mask_rotated_x = generate_drr(nodule_mask_3d, rotation_x_rad=np.deg2rad(30),
-                                  default_pixel_value=0, interpolator=sitk.sitkNearestNeighbor)
+#     # マスク画像のDRRを生成（デフォルト値は0, 補間は最近傍法）
+#     mask_frontal = generate_drr(nodule_mask_3d, 0, 0, 0, 
+#                                 default_pixel_value=0, interpolator=sitk.sitkNearestNeighbor)
+#     mask_rotated_x = generate_drr(nodule_mask_3d, rotation_x_rad=np.deg2rad(30),
+#                                   default_pixel_value=0, interpolator=sitk.sitkNearestNeighbor)
     
-    # --- 生成したDRRを並べて表示 ---
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+#     # --- 生成したDRRを並べて表示 ---
+#     fig, axes = plt.subplots(1, 2, figsize=(16, 8))
     
-    axes_flat = axes.flat
+#     axes_flat = axes.flat
 
-    axes_flat[0].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(drr_frontal))), cmap='gray')
-    axes_flat[0].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(mask_frontal))) > 0, cmap='Reds', alpha=0.5)
-    axes_flat[0].set_title('Frontal View with Nodule Mask')
-    axes_flat[0].axis('off')
+#     axes_flat[0].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(drr_frontal))), cmap='gray')
+#     axes_flat[0].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(mask_frontal))) > 0, cmap='Reds', alpha=0.5)
+#     axes_flat[0].set_title('Frontal View with Nodule Mask')
+#     axes_flat[0].axis('off')
 
-    axes_flat[1].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(drr_rotated_x))), cmap='gray')
-    axes_flat[1].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(mask_rotated_x))) > 0, cmap='Reds', alpha=0.5)
-    axes_flat[1].set_title('Rotated View with Nodule Mask')
-    axes_flat[1].axis('off')
+#     axes_flat[1].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(drr_rotated_x))), cmap='gray')
+#     axes_flat[1].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(mask_rotated_x))) > 0, cmap='Reds', alpha=0.5)
+#     axes_flat[1].set_title('Rotated View with Nodule Mask')
+#     axes_flat[1].axis('off')
     
-    plt.show()
+   
 
 
-if __name__ == '__main__':
-    main()
+# if __name__ == '__main__':
+#     main()
+
 
 
 
