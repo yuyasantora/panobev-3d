@@ -1,0 +1,15 @@
+torch
+torchvision
+torchio
+monai
+itk
+itk-io
+itk-filtering
+itk-registration
+itk-segmentation
+SimpleITK
+numpy
+scipy
+matplotlib
+tqdm
+pydicom
