@@ -85,11 +85,15 @@ def build_dataset():
             nodule_mask_3d = drr_gen.create_nodule_mask(xml_path, original_image, resampled_image)
             bev_target = drr_gen.create_bev_target(nodule_mask_3d)
 
-            bev_array = sitk.GetArrayFromImage(bev_target)
+            # --- ★★★ ここが修正点 ★★★ ---
+            # 3. BEVターゲットを保存
+            # np.squeeze() を追加して、2D配列に変換してから保存する
+            bev_array = np.squeeze(sitk.GetArrayFromImage(bev_target))
             target_filename = f"{patient_id}_bev.npy"
             np.save(os.path.join(target_dir, target_filename), bev_array)
             print(f"  BEVターゲットを保存しました: {target_filename}")
 
+            # 4. 各角度でDRRを生成して保存
             for angle in ROTATION_ANGLES_X:
                 drr = drr_gen.generate_drr(resampled_image, rotation_x_rad=np.deg2rad(angle))
                 drr_array = np.squeeze(sitk.GetArrayFromImage(drr))
