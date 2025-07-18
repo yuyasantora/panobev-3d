@@ -90,10 +90,19 @@ def build_dataset():
     random.seed(RANDOM_SEED)
     random.shuffle(all_patient_dirs)
 
-    # ★ 3. 患者リストを分割
+    # ★ 3. 患者リストを分割 (より堅牢な方法に修正)
     num_patients = len(all_patient_dirs)
+    
     n_train = int(num_patients * SPLIT_RATIOS['train'])
     n_val = int(num_patients * SPLIT_RATIOS['val'])
+
+    # データが少なくn_valが0になった場合でも、残りの患者がいれば1人割り当てる
+    if n_val == 0 and n_train < num_patients:
+        n_val = 1
+    
+    # 割り当ての結果、合計が全体数を超えないようにtrainを調整
+    if n_train + n_val >= num_patients:
+        n_train = num_patients - n_val
     
     train_patients = all_patient_dirs[:n_train]
     val_patients = all_patient_dirs[n_train:n_train + n_val]
