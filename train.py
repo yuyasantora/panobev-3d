@@ -20,7 +20,7 @@ VIT_MODEL_NAME = 'google/vit-base-patch16-224-in21k' # Hugging Faceの事前学�
 # ★★★ 学習に関する設定を追加 ★★★
 LEARNING_RATE = 1e-4 # 学習率
 # ★★★ 学習エポック数を追加 ★★★
-NUM_EPOCHS = 20 # データセット全体を何周学習させるか
+NUM_EPOCHS = 1000 # データセット全体を何周学習させるか
 
 class PanoBEVDataset(Dataset):
     """
@@ -152,80 +152,92 @@ class ViTPanoBEV(nn.Module):
 
 def main():
     """
-    学習プロセスのメイン関数
+    学習と検証プロセスのメイン関数
     """
     # --- 1. 準備 ---
-    # データローダー
-    print("データセットを読み込んでいます...")
-    # ★ PanoBEVDataset を使用するように変更
-    dataset = PanoBEVDataset(dataset_dir=DATASET_DIR, resize_shape=RESIZE_SHAPE)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    print(f"データセットの総数: {len(dataset)}")
-
-    # デバイス
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用デバイス: {device}")
 
-    # ★ ViTForPanoBEV モデルを使用するように変更
+    # ★ データローダーを学習用と検証用に分けて作成
+    print("データセットを読み込んでいます...")
+    train_dataset = PanoBEVDataset(dataset_dir=os.path.join(DATASET_DIR, 'train'), resize_shape=RESIZE_SHAPE)
+    val_dataset = PanoBEVDataset(dataset_dir=os.path.join(DATASET_DIR, 'val'), resize_shape=RESIZE_SHAPE)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+    
+    print(f"学習データ数: {len(train_dataset)}, 検証データ数: {len(val_dataset)}")
+
+    # モデル
     model = ViTPanoBEV(vit_model_name=VIT_MODEL_NAME).to(device)
 
-    # ★ 損失関数を2つ定義
-    criterion_bev = nn.BCEWithLogitsLoss() # BEV用 (Sigmoid不要)
-    criterion_depth = nn.MSELoss()         # 深度用
-    
+    # 損失関数とオプティマイザ
+    criterion_bev = nn.BCEWithLogitsLoss()
+    criterion_depth = nn.MSELoss()
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+
+    # ★ 最良モデルを保存するための変数を初期化
+    best_val_loss = float('inf')
 
     print("\n--- 学習開始 ---")
     
     # --- 2. 学習ループ ---
     for epoch in range(NUM_EPOCHS):
         print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}")
+        print("-" * 20)
+
+        # --- 学習フェーズ ---
         model.train()
+        running_train_loss = 0.0
         
-        running_loss = 0.0
-        
-        # ★ データローダーの出力を3つに更新
-        for i, (images, bev_targets, depth_targets) in enumerate(tqdm(dataloader, desc="Training")):
-            # データをデバイスに送る
-            images = images.to(device)
-            bev_targets = bev_targets.to(device)
-            depth_targets = depth_targets.to(device)
+        for images, bev_targets, depth_targets in tqdm(train_loader, desc="Training"):
+            images, bev_targets, depth_targets = images.to(device), bev_targets.to(device), depth_targets.to(device)
             
-            # --- 順伝播 ---
-            # ★ モデルから2つの出力を受け取る
+            optimizer.zero_grad()
+            
             predicted_bev, predicted_depth = model(images)
-            
-            # ★ 2つの損失を計算
             loss_bev = criterion_bev(predicted_bev, bev_targets)
             loss_depth = criterion_depth(predicted_depth, depth_targets)
-            
-            # ★ 損失を合計する (正規化後は重みを一旦1.0に戻す)
             total_loss = loss_bev + loss_depth
             
-            # --- 逆伝播と最適化 ---
-            optimizer.zero_grad()
-            total_loss.backward() # 合計損失で逆伝播
+            total_loss.backward()
             optimizer.step()
             
-            running_loss += total_loss.item()
+            running_train_loss += total_loss.item() * images.size(0)
             
-        epoch_loss = running_loss / len(dataloader)
-        print(f"Epoch {epoch + 1} - Average Loss: {epoch_loss:.4f}")
+        epoch_train_loss = running_train_loss / len(train_dataset)
 
-        # ★ モデルの保存 (10エポックごと)
-        if (epoch + 1) % 10 == 0:
-            torch.save(model.state_dict(), f"panobev_model_epoch_{epoch + 1}.pth")
+        # --- 検証フェーズ ---
+        model.eval()
+        running_val_loss = 0.0
+        
+        with torch.no_grad():
+            for images, bev_targets, depth_targets in tqdm(val_loader, desc="Validation"):
+                images, bev_targets, depth_targets = images.to(device), bev_targets.to(device), depth_targets.to(device)
+
+                predicted_bev, predicted_depth = model(images)
+                loss_bev = criterion_bev(predicted_bev, bev_targets)
+                loss_depth = criterion_depth(predicted_depth, depth_targets)
+                total_loss = loss_bev + loss_depth
+                
+                running_val_loss += total_loss.item() * images.size(0)
+
+        epoch_val_loss = running_val_loss / len(val_dataset)
+        
+        print(f"Train Loss: {epoch_train_loss:.4f}, Val Loss: {epoch_val_loss:.4f}")
+
+        # ★ 検証ロスが改善した場合、モデルを保存
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            torch.save(model.state_dict(), "panobev_model_best.pth")
+            print(f"  -> Best model saved with validation loss: {best_val_loss:.4f}")
 
     print("\n--- 学習完了 ---")
-
-    # ★ 学習済みモデルの最終版を保存
-    model_save_path = "panobev_model_final.pth"
-    torch.save(model.state_dict(), model_save_path)
-    print(f"学習済みモデルを '{model_save_path}' に保存しました。")
+    print(f"最も良かった検証ロス: {best_val_loss:.4f}")
+    print("最も性能の良いモデルが 'panobev_model_best.pth' として保存されました。")
 
 
 if __name__ == '__main__':
-    # Windowsで 'An attempt has been made to start a new process before...' エラーを防ぐ
     if os.name == 'nt':
         torch.multiprocessing.freeze_support()
     main()
