@@ -1,0 +1,1 @@
+"# panobev-3d"  initgit add README.mdgit commit -m "first commit"git branch -M maingit remote add origin https://github.com/yuyasantora/panobev-3d.gitgit push -u origin main
