@@ -202,55 +202,86 @@ def generate_depth_map(image: sitk.Image,
     return depth_map_image
 
 
-# def main():
-#     # --- DICOMデータの読み込み ---
-#     dicom_dir = r'data\manifest-1752629384107\LIDC-IDRI\LIDC-IDRI-0001\01-01-2000-NA-NA-30178\3000566.000000-NA-03192'
-#     xml_path = os.path.join(dicom_dir, '069.xml')
+def main():
+    """
+    モジュールの動作テスト用関数。
+    DICOMデータを1つ読み込み、DRR、マスク、深度マップを生成して表示する。
+    """
+    # --- 必要なライブラリのインポート ---
+    # この関数内でのみ使用するため、ここでインポートします。
+    import matplotlib.pyplot as plt
+
+    # --- DICOMデータとXMLファイルのパスを指定 ---
+    # 注意: このパスはご自身の環境に合わせて変更が必要な場合があります。
+    dicom_dir = r'data/manifest-1752629384107/LIDC-IDRI/LIDC-IDRI-0001/01-01-2000-NA-NA-30178/3000566.000000-NA-03192'
+    xml_path = os.path.join(dicom_dir, '069.xml')
     
-#     if not os.path.isdir(dicom_dir):
-#         print(f"エラー: ディレクトリが存在しません: {dicom_dir}")
-#         return
+    if not os.path.isdir(dicom_dir):
+        print(f"エラー: 指定されたDICOMディレクトリが存在しません: {dicom_dir}")
+        print("処理を中断します。main関数内のdicom_dirのパスを確認してください。")
+        return
 
-#     reader = sitk.ImageSeriesReader()
-#     dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir)
-#     reader.SetFileNames(dicom_names)
-#     original_image = reader.Execute()
-#     resampled_image = resample_image_to_isotropic(original_image)
+    # --- データの読み込みと前処理 ---
+    print("--- 3D CTデータの読み込みとリサンプリングを開始 ---")
+    reader = sitk.ImageSeriesReader()
+    dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir)
+    reader.SetFileNames(dicom_names)
+    original_image = reader.Execute()
+    resampled_image = resample_image_to_isotropic(original_image)
+    print("--- 3D CTデータの読み込みとリサンプリングが完了 ---\n")
 
-#     # --- 結節マスクの作成 ---
-#     nodule_mask_3d = create_nodule_mask(xml_path, original_image, resampled_image)
+    # --- 結節マスクの作成 ---
+    nodule_mask_3d = create_nodule_mask(xml_path, original_image, resampled_image)
 
-#     # DRRとマスクDRRの生成
-#     # CT画像のDRRを生成（デフォルト値は-1000, 補間は線形）
-#     drr_frontal = generate_drr(resampled_image, 0, 0, 0)
-#     drr_rotated_x = generate_drr(resampled_image, rotation_x_rad=np.deg2rad(30))
+    # --- DRR、マスク、深度マップの生成 ---
+    print("\n--- DRR、マスク、深度マップの生成を開始 ---")
+    # 正面からのデータ
+    drr_frontal = generate_drr(resampled_image, 0, 0, 0)
+    mask_frontal = generate_drr(nodule_mask_3d, 0, 0, 0, default_pixel_value=0, interpolator=sitk.sitkNearestNeighbor)
+    depth_frontal = generate_depth_map(resampled_image, 0, 0, 0)
+
+    # X軸周りに30度回転したデータ
+    rotation_angle_rad = np.deg2rad(30)
+    drr_rotated_x = generate_drr(resampled_image, rotation_x_rad=rotation_angle_rad)
+    mask_rotated_x = generate_drr(nodule_mask_3d, rotation_x_rad=rotation_angle_rad, default_pixel_value=0, interpolator=sitk.sitkNearestNeighbor)
+    depth_rotated_x = generate_depth_map(resampled_image, rotation_x_rad=rotation_angle_rad)
+    print("--- DRR、マスク、深度マップの生成が完了 ---\n")
     
-#     # マスク画像のDRRを生成（デフォルト値は0, 補間は最近傍法）
-#     mask_frontal = generate_drr(nodule_mask_3d, 0, 0, 0, 
-#                                 default_pixel_value=0, interpolator=sitk.sitkNearestNeighbor)
-#     mask_rotated_x = generate_drr(nodule_mask_3d, rotation_x_rad=np.deg2rad(30),
-#                                   default_pixel_value=0, interpolator=sitk.sitkNearestNeighbor)
+    # --- 生成した画像を並べて表示 ---
+    print("--- 結果の可視化 ---")
+    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+    axes_flat = axes.flat
+
+    # 1. 正面DRRとマスク (★修正箇所)
+    axes_flat[0].set_title('Frontal DRR with Nodule Mask')
+    axes_flat[0].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(drr_frontal))), cmap='gray')
+    axes_flat[0].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(mask_frontal))) > 0, cmap='Reds', alpha=0.5)
+    axes_flat[0].axis('off')
+
+    # 2. 回転DRRとマスク (★修正箇所)
+    axes_flat[1].set_title('Rotated DRR with Nodule Mask')
+    axes_flat[1].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(drr_rotated_x))), cmap='gray')
+    axes_flat[1].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(mask_rotated_x))) > 0, cmap='Reds', alpha=0.5)
+    axes_flat[1].axis('off')
     
-#     # --- 生成したDRRを並べて表示 ---
-#     fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    # 3. 正面深度マップ (変更なし)
+    axes_flat[2].set_title('Frontal Depth Map')
+    im_depth_frontal = axes_flat[2].imshow(np.rot90(sitk.GetArrayFromImage(depth_frontal)), cmap='viridis')
+    axes_flat[2].axis('off')
+    fig.colorbar(im_depth_frontal, ax=axes_flat[2])
     
-#     axes_flat = axes.flat
-
-#     axes_flat[0].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(drr_frontal))), cmap='gray')
-#     axes_flat[0].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(mask_frontal))) > 0, cmap='Reds', alpha=0.5)
-#     axes_flat[0].set_title('Frontal View with Nodule Mask')
-#     axes_flat[0].axis('off')
-
-#     axes_flat[1].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(drr_rotated_x))), cmap='gray')
-#     axes_flat[1].imshow(np.rot90(np.squeeze(sitk.GetArrayFromImage(mask_rotated_x))) > 0, cmap='Reds', alpha=0.5)
-#     axes_flat[1].set_title('Rotated View with Nodule Mask')
-#     axes_flat[1].axis('off')
+    # 4. 回転深度マップ (変更なし)
+    axes_flat[3].set_title('Rotated Depth Map')
+    im_depth_rotated = axes_flat[3].imshow(np.rot90(sitk.GetArrayFromImage(depth_rotated_x)), cmap='viridis')
+    axes_flat[3].axis('off')
+    fig.colorbar(im_depth_rotated, ax=axes_flat[3])
     
-   
+    plt.tight_layout()
+    plt.show()
 
 
-# if __name__ == '__main__':
-#     main()
+if __name__ == '__main__':
+    main()
 
 
 

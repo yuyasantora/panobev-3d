@@ -55,8 +55,11 @@ def build_dataset():
     """
     image_dir = os.path.join(OUTPUT_DIR, 'images')
     target_dir = os.path.join(OUTPUT_DIR, 'targets')
+    depth_dir = os.path.join(OUTPUT_DIR, 'depths')
     os.makedirs(image_dir, exist_ok=True)
     os.makedirs(target_dir, exist_ok=True)
+    os.makedirs(depth_dir, exist_ok=True)
+    
 
     patient_dirs = [os.path.join(ROOT_DATA_DIR, d) for d in os.listdir(ROOT_DATA_DIR) if os.path.isdir(os.path.join(ROOT_DATA_DIR, d))]
     
@@ -85,7 +88,6 @@ def build_dataset():
             nodule_mask_3d = drr_gen.create_nodule_mask(xml_path, original_image, resampled_image)
             bev_target = drr_gen.create_bev_target(nodule_mask_3d)
 
-            # --- ★★★ ここが修正点 ★★★ ---
             # 3. BEVターゲットを保存
             # np.squeeze() を追加して、2D配列に変換してから保存する
             bev_array = np.squeeze(sitk.GetArrayFromImage(bev_target))
@@ -95,11 +97,23 @@ def build_dataset():
 
             # 4. 各角度でDRRを生成して保存
             for angle in ROTATION_ANGLES_X:
-                drr = drr_gen.generate_drr(resampled_image, rotation_x_rad=np.deg2rad(angle))
+                angle_rad = np.deg2rad(angle)
+
+                # DRRの生成と保存
+                drr = drr_gen.generate_drr(resampled_image, rotation_x_rad=angle_rad)
                 drr_array = np.squeeze(sitk.GetArrayFromImage(drr))
                 image_filename = f"{patient_id}_rotX{angle:+04d}.npy"
                 np.save(os.path.join(image_dir, image_filename), drr_array)
                 print(f"  DRRを保存しました: {image_filename}")
+
+                # 深度マップの生成と保存
+                depth_map = drr_gen.generate_depth_map(resampled_image, rotation_x_rad=angle_rad)
+                depth_array = np.squeeze(sitk.GetArrayFromImage(depth_map))
+                depth_filename = f"{patient_id}_rotX{angle:+04d}_depth.npy"
+                np.save(os.path.join(depth_dir, depth_filename), depth_array)
+                print(f"  Depth Mapを保存しました: {depth_filename}")
+                
+                
 
         except Exception as e:
             print(f"  [!!!] 処理中に予期せぬエラーが発生しました: {e}")
@@ -107,7 +121,8 @@ def build_dataset():
 
     print("\nデータセットの構築が完了しました！")
     print(f"  入力画像は '{image_dir}' に保存されています。")
-    print(f"  教師ターゲットは '{target_dir}' に保存されています。")
+    print(f"  教師ターゲット(BEV)は '{target_dir}' に保存されています。")
+    print(f"  深度マップは '{depth_dir}' に保存されています。")
 
 
 if __name__ == '__main__':
