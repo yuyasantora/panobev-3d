@@ -20,115 +20,119 @@ VIT_MODEL_NAME = 'google/vit-base-patch16-224-in21k' # Hugging Faceの事前学�
 # ★★★ 学習に関する設定を追加 ★★★
 LEARNING_RATE = 1e-4 # 学習率
 # ★★★ 学習エポック数を追加 ★★★
-NUM_EPOCHS = 200 # データセット全体を何周学習させるか
+NUM_EPOCHS = 20 # データセット全体を何周学習させるか
 
-class BEVDataset(Dataset):
+class PanoBEVDataset(Dataset):
     """
-    DRR画像とBEVターゲットを読み込み、固定サイズにリサイズするカスタムデータセットクラス
+    DRR画像、BEVターゲット、深度マップを読み込み、
+    固定サイズにリサイズするカスタムデータセットクラス
     """
     def __init__(self, dataset_dir: str, resize_shape: tuple):
         self.image_dir = os.path.join(dataset_dir, 'images')
         self.target_dir = os.path.join(dataset_dir, 'targets')
-        self.resize_shape = resize_shape # ★ 固定サイズを保存
+        self.depth_dir = os.path.join(dataset_dir, 'depths')
+        self.resize_shape = resize_shape
         
-        # 全ての画像ファイルのリストを取得
         self.image_files = sorted([f for f in os.listdir(self.image_dir) if f.endswith('.npy')])
 
     def __len__(self):
-        # データセットの総数を返す (画像の枚数)
         return len(self.image_files)
 
     def __getitem__(self, idx):
-        # パスの取得とNumpy配列の読み込み
+        # --- 1. パスの取得 ---
         image_filename = self.image_files[idx]
         image_path = os.path.join(self.image_dir, image_filename)
-        patient_id = image_filename.split('_')[0]
-        target_filename = f"{patient_id}_bev.npy"
-        target_path = os.path.join(self.target_dir, target_filename)
-
-        image = np.load(image_path)
-        target = np.load(target_path)
-
-        # NumPy配列をSimpleITK Imageに変換
-        image_sitk = sitk.GetImageFromArray(image, isVector=False)
-        target_sitk = sitk.GetImageFromArray(target, isVector=False)
-
-        # --- リサイズ処理 ---
-        # 変換の基となる、何もしない変換（Identity Transform）を定義
-        identity_transform = sitk.Transform()
-
-        # --- 画像(DRR)のリサイズ ---
-        # 目標サイズの参照グリッドを作成
-        ref_image = sitk.Image(self.resize_shape, image_sitk.GetPixelIDValue())
-        # 物理的な縦横比を維持するための新しいスペーシングを計算
-        old_size = image_sitk.GetSize()
-        old_spacing = image_sitk.GetSpacing()
-        new_spacing = [old_sp * (old_sz / new_sz) for old_sp, old_sz, new_sz in zip(old_spacing, old_size, self.resize_shape)]
-        ref_image.SetSpacing(new_spacing)
-        ref_image.SetOrigin(image_sitk.GetOrigin())
-        ref_image.SetDirection(image_sitk.GetDirection())
-        # 高レベルなResample関数を使用
-        resized_image_sitk = sitk.Resample(image_sitk, ref_image, identity_transform, sitk.sitkLinear, image_sitk.GetPixelIDValue())
-
-        # --- ターゲット(BEV)のリサイズ ---
-        # 目標サイズの参照グリッドを作成
-        ref_target = sitk.Image(self.resize_shape, target_sitk.GetPixelIDValue())
-        # BEVも同様に、縦横比を維持するスペーシングを計算
-        old_size_tgt = target_sitk.GetSize()
-        old_spacing_tgt = target_sitk.GetSpacing()
-        new_spacing_tgt = [old_sp * (old_sz / new_sz) for old_sp, old_sz, new_sz in zip(old_spacing_tgt, old_size_tgt, self.resize_shape)]
-        ref_target.SetSpacing(new_spacing_tgt)
-        ref_target.SetOrigin(target_sitk.GetOrigin())
-        ref_target.SetDirection(target_sitk.GetDirection())
-        # 高レベルなResample関数を使用
-        resized_target_sitk = sitk.Resample(target_sitk, ref_target, identity_transform, sitk.sitkNearestNeighbor, 0)
         
-        # SimpleITK Imageを再びNumPy配列に戻す
+        base_filename = image_filename.replace('.npy', '')
+        patient_id = base_filename.split('_')[0]
+        
+        bev_filename = f"{patient_id}_bev.npy"
+        bev_path = os.path.join(self.target_dir, bev_filename)
+        
+        # ★★★ 修正点1: 正しい深度マップのファイル名を構築 ★★★
+        depth_filename = f"{base_filename}_depth.npy" 
+        depth_path = os.path.join(self.depth_dir, depth_filename)
+
+        # --- 2. NumPy配列の読み込み ---
+        image = np.load(image_path)
+        bev_target = np.load(bev_path)
+        depth_target = np.load(depth_path)
+
+        # --- 3. SimpleITK Imageに変換 ---
+        image_sitk = sitk.GetImageFromArray(image)
+        bev_sitk = sitk.GetImageFromArray(bev_target)
+        depth_sitk = sitk.GetImageFromArray(depth_target)
+
+        # --- 4. 共通のリサイズ関数を定義 ---
+        def resize_image(sitk_image, interpolator):
+            ref_image = sitk.Image(self.resize_shape, sitk_image.GetPixelIDValue())
+            old_size = sitk_image.GetSize()
+            old_spacing = sitk_image.GetSpacing()
+            new_spacing = [old_sp * (old_sz / new_sz) for old_sp, old_sz, new_sz in zip(old_spacing, old_size, self.resize_shape)]
+            ref_image.SetSpacing(new_spacing)
+            ref_image.SetOrigin(sitk_image.GetOrigin())
+            ref_image.SetDirection(sitk_image.GetDirection())
+            return sitk.Resample(sitk_image, ref_image, sitk.Transform(), interpolator, sitk_image.GetPixelIDValue())
+
+        # ★★★ 修正点2: 適切な補間方法を選択 ★★★
+        resized_image_sitk = resize_image(image_sitk, sitk.sitkLinear)
+        resized_bev_sitk = resize_image(bev_sitk, sitk.sitkNearestNeighbor)
+        resized_depth_sitk = resize_image(depth_sitk, sitk.sitkLinear)
+
+        # --- 5. NumPy配列に戻す ---
         resized_image = sitk.GetArrayFromImage(resized_image_sitk)
-        resized_target = sitk.GetArrayFromImage(resized_target_sitk)
+        resized_bev = sitk.GetArrayFromImage(resized_bev_sitk)
+        resized_depth = sitk.GetArrayFromImage(resized_depth_sitk)
 
-        # PyTorchのテンソルに変換
-        image_tensor = torch.from_numpy(resized_image).float().unsqueeze(0) 
-        target_tensor = torch.from_numpy(resized_target).float()
+        # ★★★ 新しい修正点: 深度マップの正規化 ★★★
+        # 深度マップの最大値で割ることで、値を0-1の範囲に収める
+        # ゼロ除算を避けるために、微小な値(epsilon)を加える
+        epsilon = 1e-6
+        if np.max(resized_depth) > epsilon:
+            resized_depth = resized_depth / np.max(resized_depth)
 
-        return image_tensor, target_tensor
+        # ★★★ 修正点3: テンソルに変換し、float型に指定 ★★★
+        image_tensor = torch.from_numpy(resized_image).float().unsqueeze(0)
+        bev_tensor = torch.from_numpy(resized_bev).float().unsqueeze(0)
+        depth_tensor = torch.from_numpy(resized_depth).float().unsqueeze(0)
+       
+        return image_tensor, bev_tensor, depth_tensor
     
-class ViTForBEVGeneration(nn.Module):
+class ViTPanoBEV(nn.Module):
     """
     Vision TransformerエンコーダーとCNNデコーダーを組み合わせた
-    BEVマップ生成モデル
+    組み合わせたマルチタスクモデル
     """
-    def __init__(self, vit_model_name, output_shape):
+    def __init__(self, vit_model_name):
         super().__init__()
         
         self.vit = ViTModel.from_pretrained(vit_model_name)
         hidden_size = self.vit.config.hidden_size
-        self.output_shape = output_shape
+        self.output_shape = self.vit.config.image_size
 
-        # --- ★★★ デコーダーの定義を一つに統合 ★★★ ---
-        # ViTの出力（潜在表現）を受け取り、目標のBEVマップサイズまでアップサンプリングする
-        self.decoder = nn.Sequential(
-            # 1. MLPで特徴量を拡張
-            nn.Linear(hidden_size, 512),
-            nn.ReLU(),
-            nn.Linear(512, 14 * 14 * 128),
-            nn.ReLU(),
-            
-            # 2. ベクトルを画像形式に変形
-            nn.Unflatten(1, (128, 14, 14)),
-            
-            # 3. 畳み込み層でアップサンプリング
-            nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1), # 14x14 -> 28x28
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1), # 28x28 -> 56x56
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # 56x56 -> 112x112
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),  # 112x112 -> 224x224
-            nn.ReLU(),
-            nn.Conv2d(16, 1, kernel_size=3, padding=1),
-            nn.Sigmoid()
-        )
+         # --- デコーダーの共通部分を関数として定義 ---
+        def create_decoder():
+            return nn.Sequential(
+                nn.Linear(hidden_size, 512),
+                nn.ReLU(),
+                nn.Linear(512, 14 * 14 * 128),
+                nn.ReLU(),
+                nn.Unflatten(1, (128, 14, 14)),
+                nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1), # -> 28x28
+                nn.ReLU(),
+                nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1), # -> 56x56
+                nn.ReLU(),
+                nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # -> 112x112
+                nn.ReLU(),
+                nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),  # -> 224x224
+                nn.ReLU(),
+                nn.Conv2d(16, 1, kernel_size=3, padding=1)
+                # 活性化関数(Sigmoid)は損失関数側で考慮するため、ここでは外す
+            )
+        
+        # --- 深度マップとBEVマップ用の二つのデコーダーを作成
+        self.bev_decoder = create_decoder()
+        self.depth_decoder = create_decoder()
 
     def forward(self, x):
         # --- ★★★ forwardパスをシンプルに修正 ★★★ ---
@@ -140,9 +144,10 @@ class ViTForBEVGeneration(nn.Module):
         encoder_output = outputs.last_hidden_state[:, 0, :] # (バッチ, 768)
 
         # 2. デコーダーで一気に画像を生成
-        bev_map = self.decoder(encoder_output)
+        bev_map = self.bev_decoder(encoder_output)
+        depth_map = self.depth_decoder(encoder_output)
         
-        return bev_map
+        return bev_map, depth_map
 
 
 def main():
@@ -152,7 +157,8 @@ def main():
     # --- 1. 準備 ---
     # データローダー
     print("データセットを読み込んでいます...")
-    dataset = BEVDataset(dataset_dir=DATASET_DIR, resize_shape=RESIZE_SHAPE)
+    # ★ PanoBEVDataset を使用するように変更
+    dataset = PanoBEVDataset(dataset_dir=DATASET_DIR, resize_shape=RESIZE_SHAPE)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
     print(f"データセットの総数: {len(dataset)}")
 
@@ -160,61 +166,66 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用デバイス: {device}")
 
-    # モデル
-    model = ViTForBEVGeneration(vit_model_name=VIT_MODEL_NAME, output_shape=RESIZE_SHAPE).to(device)
+    # ★ ViTForPanoBEV モデルを使用するように変更
+    model = ViTPanoBEV(vit_model_name=VIT_MODEL_NAME).to(device)
 
-    # 損失関数とオプティマイザ
-    criterion = nn.MSELoss()
+    # ★ 損失関数を2つ定義
+    criterion_bev = nn.BCEWithLogitsLoss() # BEV用 (Sigmoid不要)
+    criterion_depth = nn.MSELoss()         # 深度用
+    
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
 
     print("\n--- 学習開始 ---")
     
     # --- 2. 学習ループ ---
     for epoch in range(NUM_EPOCHS):
-        # 現在のエポック数を表示
         print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}")
+        model.train()
         
-        model.train() # モデルを訓練モードに設定
+        running_loss = 0.0
         
-        running_loss = 0.0 # エポック内の損失を記録するための変数
-        
-        # データローダーからバッチ単位でデータを取り出す
-        # tqdmを使って進捗バーを表示
-        for i, (images, targets) in enumerate(tqdm(dataloader, desc="Training")):
+        # ★ データローダーの出力を3つに更新
+        for i, (images, bev_targets, depth_targets) in enumerate(tqdm(dataloader, desc="Training")):
             # データをデバイスに送る
             images = images.to(device)
-            targets = targets.to(device)
+            bev_targets = bev_targets.to(device)
+            depth_targets = depth_targets.to(device)
             
-            # --- 順伝播 (Forward pass) ---
-            predicted_bev = model(images)
-            loss = criterion(predicted_bev.squeeze(1), targets)
+            # --- 順伝播 ---
+            # ★ モデルから2つの出力を受け取る
+            predicted_bev, predicted_depth = model(images)
             
-            # --- 逆伝播 (Backward pass) と最適化 ---
-            # 1. 勾配をリセット
+            # ★ 2つの損失を計算
+            loss_bev = criterion_bev(predicted_bev, bev_targets)
+            loss_depth = criterion_depth(predicted_depth, depth_targets)
+            
+            # ★ 損失を合計する (正規化後は重みを一旦1.0に戻す)
+            total_loss = loss_bev + loss_depth
+            
+            # --- 逆伝播と最適化 ---
             optimizer.zero_grad()
-            # 2. 損失を基に勾配を計算
-            loss.backward()
-            # 3. 計算した勾配を基にモデルの重みを更新
+            total_loss.backward() # 合計損失で逆伝播
             optimizer.step()
             
-            # 損失を記録
-            running_loss += loss.item()
+            running_loss += total_loss.item()
             
-        # エポックごとの平均損失を計算して表示
         epoch_loss = running_loss / len(dataloader)
         print(f"Epoch {epoch + 1} - Average Loss: {epoch_loss:.4f}")
+
+        # ★ モデルの保存 (10エポックごと)
         if (epoch + 1) % 10 == 0:
-            torch.save(model.state_dict(), f"bev_generation_model_{epoch + 1}.pth")
+            torch.save(model.state_dict(), f"panobev_model_epoch_{epoch + 1}.pth")
 
     print("\n--- 学習完了 ---")
 
-    # (オプション) 学習済みモデルの重みを保存
-    model_save_path = "bev_generation_last.pth"
+    # ★ 学習済みモデルの最終版を保存
+    model_save_path = "panobev_model_final.pth"
     torch.save(model.state_dict(), model_save_path)
     print(f"学習済みモデルを '{model_save_path}' に保存しました。")
 
 
 if __name__ == '__main__':
+    # Windowsで 'An attempt has been made to start a new process before...' エラーを防ぐ
     if os.name == 'nt':
         torch.multiprocessing.freeze_support()
     main()

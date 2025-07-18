@@ -3,13 +3,13 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-# train.pyからモデル定義とデータローダー定義をインポート
-from train import ViTForBEVGeneration, BEVDataset
+# train.pyから新しいモデルとデータセット定義をインポート
+from train import ViTPanoBEV, PanoBEVDataset 
 from torch.utils.data import DataLoader
 
 # --- 設定項目 ---
 # 学習済みモデルの重みファイルへのパス
-MODEL_PATH = "bev_generation_model_91.pth" 
+MODEL_PATH = "panobev_model_final.pth" 
 # データセットのディレクトリ
 DATASET_DIR = 'dataset'
 # モデル定義 (train.pyと一致させる)
@@ -21,62 +21,75 @@ def inference():
     推論を実行し、結果を可視化するメイン関数
     """
     # --- 1. 準備 ---
-    # デバイスの指定
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用デバイス: {device}")
 
     # --- 2. モデルのロード ---
     print(f"学習済みモデルを '{MODEL_PATH}' からロードしています...")
-    # まず、モデルの「器」を定義
-    model = ViTForBEVGeneration(vit_model_name=VIT_MODEL_NAME, output_shape=RESIZE_SHAPE)
-    # 次に、学習済みの重みをロード
+    # ★ 新しいモデルの器を定義
+    model = ViTPanoBEV(vit_model_name=VIT_MODEL_NAME)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    # モデルをデバイスに送る
     model.to(device)
-    # ★★★ モデルを評価モードに設定 ★★★
-    model.eval() 
+    model.eval() # モデルを評価モードに設定
     print("モデルのロードが完了しました。")
 
     # --- 3. データローダーの準備 ---
-    # 推論時にはデータをシャッフルする必要はない
-    dataset = BEVDataset(dataset_dir=DATASET_DIR, resize_shape=RESIZE_SHAPE)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True) # バッチサイズ1で1枚ずつ処理
+    # ★ 新しいデータセットを使用
+    dataset = PanoBEVDataset(dataset_dir=DATASET_DIR, resize_shape=RESIZE_SHAPE)
+    # 推論なのでシャッフルはFalseでOK
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False) 
 
     # --- 4. 推論と可視化 ---
     print("\n推論を開始します... (ウィンドウを閉じると次の画像が表示されます)")
     
-    # torch.no_grad()ブロック内で推論を行うことで、不要な勾配計算を無効化し、メモリを節約
     with torch.no_grad():
-        for i, (image, target) in enumerate(dataloader):
+        # ★ データローダーから3つの値を受け取る
+        for i, (image, bev_target, depth_target) in enumerate(dataloader):
             image = image.to(device)
-            target = target.to(device)
+            bev_target = bev_target.to(device)
+            depth_target = depth_target.to(device)
 
-            # モデルによる予測
-            predicted_bev = model(image)
+            # ★ モデルから2つの予測結果を受け取る
+            predicted_bev_logits, predicted_depth = model(image)
+            
+            # BEVの予測を確率に変換 (Sigmoidを適用)
+            predicted_bev = torch.sigmoid(predicted_bev_logits)
 
             # --- 5. 結果をCPUに戻し、NumPy配列に変換して可視化 ---
             image_np = image.squeeze().cpu().numpy()
-            target_np = target.squeeze().cpu().numpy()
-            predicted_np = predicted_bev.squeeze().cpu().numpy()
+            bev_target_np = bev_target.squeeze().cpu().numpy()
+            depth_target_np = depth_target.squeeze().cpu().numpy()
+            predicted_bev_np = predicted_bev.squeeze().cpu().numpy()
+            predicted_depth_np = predicted_depth.squeeze().cpu().numpy()
 
-            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            # ★ 5つのプロットを作成
+            fig, axes = plt.subplots(1, 5, figsize=(25, 5))
             
             axes[0].imshow(image_np, cmap='gray')
             axes[0].set_title('Input DRR')
             axes[0].axis('off')
 
-            axes[1].imshow(target_np, cmap='hot')
-            axes[1].set_title('Ground Truth BEV')
+            axes[1].imshow(predicted_bev_np, cmap='hot', vmin=0, vmax=1)
+            axes[1].set_title('Predicted BEV')
             axes[1].axis('off')
 
-            axes[2].imshow(predicted_np, cmap='hot')
-            axes[2].set_title('Predicted BEV')
+            axes[2].imshow(bev_target_np, cmap='hot', vmin=0, vmax=1)
+            axes[2].set_title('Ground Truth BEV')
             axes[2].axis('off')
+
+            axes[3].imshow(predicted_depth_np, cmap='viridis')
+            axes[3].set_title('Predicted Depth')
+            axes[3].axis('off')
+            
+            axes[4].imshow(depth_target_np, cmap='viridis')
+            axes[4].set_title('Ground Truth Depth')
+            axes[4].axis('off')
             
             plt.suptitle(f"Inference Result #{i+1}")
+            plt.tight_layout()
             plt.show()
 
-            # (例として5枚表示したら終了)
+            # 5枚表示したら終了
             if i >= 4:
                 break
 
