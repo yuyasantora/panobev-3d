@@ -141,18 +141,65 @@ def create_bev_target(nodule_mask_3d: sitk.Image) -> sitk.Image:
     return bev_image
 
 
+def generate_depth_map(image: sitk.Image,
+                       rotation_x_rad: float = 0,
+                       rotation_y_rad: float = 0,
+                       rotation_z_rad: float = 0,
+                       default_pixel_value: int = -1000,
+                       interpolator: int = sitk.sitkLinear
+                       ) -> sitk.Image:
+    """
+    指定された角度で3D画像を回転させ、DRRと同じ視点からの深度マップを生成する。
+    深度は、視線方向（Y軸）で最初に物質（非背景ピクセル）が現れる位置（Y座標インデックス）として定義する。
+    """
+    print(f"\n深度マップ生成中... X回転: {np.rad2deg(rotation_x_rad):.1f}°, Y回転: {np.rad2deg(rotation_y_rad):.1f}°")
 
+    # 1. generate_drr と同じ回転を適用し、視点を揃える
+    image_center_phys = image.TransformContinuousIndexToPhysicalPoint([idx/2.0 for idx in image.GetSize()])
+    transform = sitk.Euler3DTransform()
+    transform.SetCenter(image_center_phys)
+    transform.SetRotation(rotation_x_rad, rotation_y_rad, rotation_z_rad)
+    
+    rotated_image = sitk.Resample(image,
+                                  image,
+                                  transform,
+                                  interpolator,
+                                  float(default_pixel_value),
+                                  image.GetPixelID())
 
+    # 2. NumPy配列に変換 (SimpleITKの(x,y,z)からNumPyの(z,y,x)へ)
+    volume_np = sitk.GetArrayFromImage(rotated_image)
 
+    # 3. 物質が存在する領域のマスクを作成（背景ピクセルより大きい値を持つかで判断）
+    tissue_mask = volume_np > default_pixel_value
+    
+    # 4. Y軸（視線方向, axis=1）で最初の物質のインデックスを検索
+    # np.argmaxは、ブール配列に対して適用すると、最初のTrueのインデックス（=距離）を返す
+    # 物質が全くない視線（すべてFalse）の場合、argmaxは0を返してしまうため、
+    # 物質が存在するピクセル（ray_has_tissue）についてのみ計算する
+    ray_has_tissue = np.any(tissue_mask, axis=1)
+    depth_map_np = np.zeros_like(ray_has_tissue, dtype=np.float32)
+    depth_map_np[ray_has_tissue] = np.argmax(tissue_mask, axis=1)[ray_has_tissue]
 
+    # 5. NumPy配列をSimpleITKイメージに変換
+    depth_map_image = sitk.GetImageFromArray(depth_map_np)
 
-
-
-
-
-
-
-
+    # 6. DRRと整合性が取れるようにメタデータ（Spacing, Origin, Direction）を設定
+    # Y軸で射影するため、回転後の3D画像のX軸とZ軸の情報を引き継ぐ
+    rotated_spacing = rotated_image.GetSpacing()
+    rotated_origin = rotated_image.GetOrigin()
+    rotated_direction = rotated_image.GetDirection()
+    
+    depth_map_image.SetSpacing([rotated_spacing[0], rotated_spacing[2]])
+    depth_map_image.SetOrigin([rotated_origin[0], rotated_origin[2]])
+    
+    # 3x3の方向行列からY軸成分を除いた2x2行列を作成して設定
+    new_direction = [rotated_direction[0], rotated_direction[2], 
+                     rotated_direction[6], rotated_direction[8]]
+    depth_map_image.SetDirection(new_direction)
+    
+    print("深度マップの生成完了")
+    return depth_map_image
 
 
 # def main():

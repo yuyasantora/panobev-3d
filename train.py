@@ -6,6 +6,9 @@ import matplotlib.pyplot as plt
 import torch.nn as nn
 from transformers import ViTModel
 import SimpleITK as sitk # ★ SimpleITKをインポート
+# ★★★ オプティマイザをインポート ★★★
+from torch.optim import AdamW
+from tqdm import tqdm # tqdmをインポート
 
 # --- 設定項目 ---
 DATASET_DIR = 'dataset'
@@ -14,6 +17,10 @@ NUM_WORKERS = 2 # データ読み込みの並列プロセス数 (Windowsでは0�
 RESIZE_SHAPE = (224, 224) # ★ 学習に使う画像の固定サイズを定義
 
 VIT_MODEL_NAME = 'google/vit-base-patch16-224-in21k' # Hugging Faceの事前学習済みViTモデル名
+# ★★★ 学習に関する設定を追加 ★★★
+LEARNING_RATE = 1e-4 # 学習率
+# ★★★ 学習エポック数を追加 ★★★
+NUM_EPOCHS = 200 # データセット全体を何周学習させるか
 
 class BEVDataset(Dataset):
     """
@@ -86,61 +93,55 @@ class BEVDataset(Dataset):
 
         return image_tensor, target_tensor
     
-class BEVModel(nn.Module):
+class ViTForBEVGeneration(nn.Module):
     """
-    Vision TransformerエンコーダとCNNエンコーダを組み合わせた
+    Vision TransformerエンコーダーとCNNデコーダーを組み合わせた
     BEVマップ生成モデル
     """
     def __init__(self, vit_model_name, output_shape):
         super().__init__()
-
-        # Vision Transformerエンコーダのインスタンス
+        
         self.vit = ViTModel.from_pretrained(vit_model_name)
-
-        # ViTの出力特徴量の次元数を取得
         hidden_size = self.vit.config.hidden_size
-
-        #2. CNN デコーダ
-        # ViTの出力を受け取り、目標のBEVマップサイズまでアップサンプリング
-        self.decoder = nn.Sequential(
-             nn.Linear(hidden_size, hidden_size * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size * 2, 24 * 24 * 64), # 24x24の画像に展開
-            nn.ReLU(),
-            # ここで (バッチ, 24*24*64) -> (バッチ, 64, 24, 24) に変形
-            
-            # --- ここから畳み込み層 ---
-            # nn.Unflatten(1, (64, 24, 24)), # reshapeの代わり
-            nn.ConvTranspose2d(64, 128, kernel_size=4, stride=2, padding=1), # 24x24 -> 48x48
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1), # 48x48 -> 96x96
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # 96x96 -> 192x192
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),  # 192x192 -> 384x384
-            nn.ReLU(),
-            nn.Conv2d(16, 1, kernel_size=3, padding=1), # 最終的な出力チャンネルを1に
-            nn.Sigmoid() # 出力を0-1の範囲に収める
-        )
         self.output_shape = output_shape
-        self.unflatten = nn.Unflatten(1, (64, 24, 24))
+
+        # --- ★★★ デコーダーの定義を一つに統合 ★★★ ---
+        # ViTの出力（潜在表現）を受け取り、目標のBEVマップサイズまでアップサンプリングする
+        self.decoder = nn.Sequential(
+            # 1. MLPで特徴量を拡張
+            nn.Linear(hidden_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, 14 * 14 * 128),
+            nn.ReLU(),
+            
+            # 2. ベクトルを画像形式に変形
+            nn.Unflatten(1, (128, 14, 14)),
+            
+            # 3. 畳み込み層でアップサンプリング
+            nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1), # 14x14 -> 28x28
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1), # 28x28 -> 56x56
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # 56x56 -> 112x112
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),  # 112x112 -> 224x224
+            nn.ReLU(),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        # 入力画像のチャネルは１なので、チャネル次元を追加
+        # --- ★★★ forwardパスをシンプルに修正 ★★★ ---
         if x.shape[1] == 1:
-            x = x.repeat(1,3,1,1)
+            x = x.repeat(1, 3, 1, 1)
 
-        # 1. ViTエンコーダ
+        # 1. ViTエンコーダーで特徴を抽出
         outputs = self.vit(x)
-        encoder_output = outputs.last_hidden_state[:, 0, :] 
+        encoder_output = outputs.last_hidden_state[:, 0, :] # (バッチ, 768)
+
+        # 2. デコーダーで一気に画像を生成
+        bev_map = self.decoder(encoder_output)
         
-        # デコーダーで画像を生成
-        decoded = self.decoder[0:5](encoder_output)
-        decoded = self.unflatten(decoded) # (バッチ, 64, 24, 24)
-
-        # 畳み込みそうでアップサンプリング
-        bev_map = self.decoder[5:](decoded)
-
         return bev_map
 
 
@@ -148,36 +149,69 @@ def main():
     """
     学習プロセスのメイン関数
     """
-    # --- データローダーの準備 ---
+    # --- 1. 準備 ---
+    # データローダー
     print("データセットを読み込んでいます...")
-    # ★ データセット作成時にリサイズ後の形状を渡す
     dataset = BEVDataset(dataset_dir=DATASET_DIR, resize_shape=RESIZE_SHAPE)
-    
-    # データローダーを作成
-    # shuffle=Trueにすることで、エポックごとにデータの順序がシャッフルされる
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    
-    # --- モデルの定義 ---
+    print(f"データセットの総数: {len(dataset)}")
+
+    # デバイス
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    model = BEVModel(vit_model_name=VIT_MODEL_NAME, output_shape=RESIZE_SHAPE)
-    model.to(device)
+    print(f"使用デバイス: {device}")
 
-    
-      # --- モデルの動作確認 ---
-    print("\nモデルに最初のバッチを入力して動作確認...")
-    images, _ = next(iter(dataloader))
-    images = images.to(device)
-    
-    # モデルの推論を実行
-    with torch.no_grad(): # 勾配計算を無効にして、純粋な推論のみ行う
-        predicted_bev = model(images)
-    
-    print(f"  入力画像の形状: {images.shape}")
-    print(f"  モデルが出力したBEVマップの形状: {predicted_bev.shape}")
+    # モデル
+    model = ViTForBEVGeneration(vit_model_name=VIT_MODEL_NAME, output_shape=RESIZE_SHAPE).to(device)
 
-    # (学習ループは次のステップで実装)
-    print("\nモデルの定義と動作確認が完了しました。次は損失関数とオプティマイザの定義です。")
+    # 損失関数とオプティマイザ
+    criterion = nn.MSELoss()
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+
+    print("\n--- 学習開始 ---")
+    
+    # --- 2. 学習ループ ---
+    for epoch in range(NUM_EPOCHS):
+        # 現在のエポック数を表示
+        print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}")
+        
+        model.train() # モデルを訓練モードに設定
+        
+        running_loss = 0.0 # エポック内の損失を記録するための変数
+        
+        # データローダーからバッチ単位でデータを取り出す
+        # tqdmを使って進捗バーを表示
+        for i, (images, targets) in enumerate(tqdm(dataloader, desc="Training")):
+            # データをデバイスに送る
+            images = images.to(device)
+            targets = targets.to(device)
+            
+            # --- 順伝播 (Forward pass) ---
+            predicted_bev = model(images)
+            loss = criterion(predicted_bev.squeeze(1), targets)
+            
+            # --- 逆伝播 (Backward pass) と最適化 ---
+            # 1. 勾配をリセット
+            optimizer.zero_grad()
+            # 2. 損失を基に勾配を計算
+            loss.backward()
+            # 3. 計算した勾配を基にモデルの重みを更新
+            optimizer.step()
+            
+            # 損失を記録
+            running_loss += loss.item()
+            
+        # エポックごとの平均損失を計算して表示
+        epoch_loss = running_loss / len(dataloader)
+        print(f"Epoch {epoch + 1} - Average Loss: {epoch_loss:.4f}")
+        if (epoch + 1) % 10 == 0:
+            torch.save(model.state_dict(), f"bev_generation_model_{epoch + 1}.pth")
+
+    print("\n--- 学習完了 ---")
+
+    # (オプション) 学習済みモデルの重みを保存
+    model_save_path = "bev_generation_last.pth"
+    torch.save(model.state_dict(), model_save_path)
+    print(f"学習済みモデルを '{model_save_path}' に保存しました。")
 
 
 if __name__ == '__main__':

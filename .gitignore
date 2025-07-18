@@ -1,0 +1,8 @@
+# Data and cache
+data/
+dataset/
+__pycache__/
+*.pyc
+
+# Figures
+Figure_1.png 
