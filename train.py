@@ -9,6 +9,7 @@ import SimpleITK as sitk # ★ SimpleITKをインポート
 # ★★★ オプティマイザをインポート ★★★
 from torch.optim import AdamW
 from tqdm import tqdm # tqdmをインポート
+import torchvision.transforms as T # ★ torchvision.transformsをインポート
 
 # --- 設定項目 ---
 DATASET_DIR = 'dataset'
@@ -25,15 +26,23 @@ NUM_EPOCHS = 1000 # データセット全体を何周学習させるか
 class PanoBEVDataset(Dataset):
     """
     DRR画像、BEVターゲット、深度マップを読み込み、
-    固定サイズにリサイズするカスタムデータセットクラス
+    データ増強を適用し、固定サイズにリサイズするカスタムデータセットクラス
     """
-    def __init__(self, dataset_dir: str, resize_shape: tuple):
+    def __init__(self, dataset_dir: str, resize_shape: tuple, is_train: bool = True):
         self.image_dir = os.path.join(dataset_dir, 'images')
         self.target_dir = os.path.join(dataset_dir, 'targets')
         self.depth_dir = os.path.join(dataset_dir, 'depths')
         self.resize_shape = resize_shape
+        self.is_train = is_train # ★ 学習用か検証用かをフラグで管理
         
         self.image_files = sorted([f for f in os.listdir(self.image_dir) if f.endswith('.npy')])
+
+        # ★ 学習データにのみデータ増強を適用する
+        if self.is_train:
+            self.augmentation_transforms = T.Compose([
+                T.RandomRotation(10), # ±10度の範囲でランダムに回転
+                T.ColorJitter(brightness=0.2, contrast=0.2), # 明るさとコントラストをランダムに変化
+            ])
 
     def __len__(self):
         return len(self.image_files)
@@ -49,7 +58,7 @@ class PanoBEVDataset(Dataset):
         bev_filename = f"{patient_id}_bev.npy"
         bev_path = os.path.join(self.target_dir, bev_filename)
         
-        # ★★★ 修正点1: 正しい深度マップのファイル名を構築 ★★★
+        
         depth_filename = f"{base_filename}_depth.npy" 
         depth_path = os.path.join(self.depth_dir, depth_filename)
 
@@ -95,6 +104,10 @@ class PanoBEVDataset(Dataset):
         image_tensor = torch.from_numpy(resized_image).float().unsqueeze(0)
         bev_tensor = torch.from_numpy(resized_bev).float().unsqueeze(0)
         depth_tensor = torch.from_numpy(resized_depth).float().unsqueeze(0)
+       
+        # ★★★ 新しい修正点: 学習データの場合のみデータ増強を適用 ★★★
+        if self.is_train:
+            image_tensor = self.augmentation_transforms(image_tensor)
        
         return image_tensor, bev_tensor, depth_tensor
     
@@ -149,6 +162,30 @@ class ViTPanoBEV(nn.Module):
         
         return bev_map, depth_map
 
+def calculate_dice_coefficient(predicted, target, epsilon=1e-6):
+    """
+    Dice係数を計算する。
+    予測とターゲットは(バッチサイズ, 1, 高さ, 幅)のテンソルを想定。
+    """
+    # 予測を確率に変換し、0.5を閾値としてバイナリマスクを作成
+    predicted_mask = (torch.sigmoid(predicted) > 0.5).float()
+    
+    # ターゲットも0/1のマスクであることを確認
+    target_mask = (target > 0.5).float()
+    
+    intersection = (predicted_mask * target_mask).sum()
+    union = predicted_mask.sum() + target_mask.sum()
+    
+    dice = (2. * intersection + epsilon) / (union + epsilon)
+    return dice.item()
+
+def calculate_rmse(predicted, target):
+    """
+    RMSE (Root Mean Square Error) を計算する。
+    """
+    mse_loss = nn.MSELoss()
+    return torch.sqrt(mse_loss(predicted, target)).item()
+
 
 def main():
     """
@@ -158,10 +195,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用デバイス: {device}")
 
-    # ★ データローダーを学習用と検証用に分けて作成
+    # ★ データローダーを学習用と検証用に分けて作成 (is_trainフラグを追加)
     print("データセットを読み込んでいます...")
-    train_dataset = PanoBEVDataset(dataset_dir=os.path.join(DATASET_DIR, 'train'), resize_shape=RESIZE_SHAPE)
-    val_dataset = PanoBEVDataset(dataset_dir=os.path.join(DATASET_DIR, 'val'), resize_shape=RESIZE_SHAPE)
+    train_dataset = PanoBEVDataset(dataset_dir=os.path.join(DATASET_DIR, 'train'), resize_shape=RESIZE_SHAPE, is_train=True)
+    val_dataset = PanoBEVDataset(dataset_dir=os.path.join(DATASET_DIR, 'val'), resize_shape=RESIZE_SHAPE, is_train=False) # 検証データには増強しない
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
@@ -172,7 +209,8 @@ def main():
     model = ViTPanoBEV(vit_model_name=VIT_MODEL_NAME).to(device)
 
     # 損失関数とオプティマイザ
-    criterion_bev = nn.BCEWithLogitsLoss()
+    pos_weight = torch.tensor([5.0]).to(device)
+    criterion_bev = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     criterion_depth = nn.MSELoss()
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
 
@@ -210,6 +248,9 @@ def main():
         # --- 検証フェーズ ---
         model.eval()
         running_val_loss = 0.0
+        # ★ 評価指標を記録するためのリストを初期化
+        val_dice_scores = []
+        val_rmse_scores = []
         
         with torch.no_grad():
             for images, bev_targets, depth_targets in tqdm(val_loader, desc="Validation"):
@@ -222,9 +263,20 @@ def main():
                 
                 running_val_loss += total_loss.item() * images.size(0)
 
+                # ★ 評価指標を計算してリストに追加
+                dice_score = calculate_dice_coefficient(predicted_bev, bev_targets)
+                rmse_score = calculate_rmse(predicted_depth, depth_targets)
+                val_dice_scores.append(dice_score)
+                val_rmse_scores.append(rmse_score)
+
         epoch_val_loss = running_val_loss / len(val_dataset)
+        # ★ エポックごとの平均評価指標を計算
+        avg_val_dice = np.mean(val_dice_scores)
+        avg_val_rmse = np.mean(val_rmse_scores)
         
+        # ★ 評価指標も一緒に表示
         print(f"Train Loss: {epoch_train_loss:.4f}, Val Loss: {epoch_val_loss:.4f}")
+        print(f"  -> Val BEV Dice: {avg_val_dice:.4f}, Val Depth RMSE: {avg_val_rmse:.4f}")
 
         # ★ 検証ロスが改善した場合、モデルを保存
         if epoch_val_loss < best_val_loss:

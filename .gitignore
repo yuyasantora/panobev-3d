@@ -6,3 +6,23 @@ __pycache__/
 
 # Figures
 Figure_1.png 
+Figure_2.png
+Figure_3.png
+Figure_4.png
+Figure_5.png
+Figure_6.png
+Figure_7.png
+Figure_8.png
+Figure_9.png
+Figure_10.png
+
+# weights
+*.pth
+*.pt
+*.pkl
+*.ptl
+*.pth.tar
+*.pt.tar
+*.pkl.tar
+*.ptl.tar
+*.pth.tar.gz

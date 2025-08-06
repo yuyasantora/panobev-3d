@@ -8,10 +8,10 @@ from train import ViTPanoBEV, PanoBEVDataset
 from torch.utils.data import DataLoader
 
 # --- 設定項目 ---
-# 学習済みモデルの重みファイルへのパス
-MODEL_PATH = "panobev_model_final.pth" 
-# データセットのディレクトリ
-DATASET_DIR = 'dataset'
+# ★ 学習済みモデルの重みファイルへのパスを更新
+MODEL_PATH = "panobev_model_best.pth" 
+# ★ 推論に使うデータセットのディレクトリを 'test' に指定
+DATASET_DIR = 'dataset/test'
 # モデル定義 (train.pyと一致させる)
 RESIZE_SHAPE = (224, 224)
 VIT_MODEL_NAME = 'google/vit-base-patch16-224-in21k'
@@ -24,9 +24,13 @@ def inference():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用デバイス: {device}")
 
+    if not os.path.exists(MODEL_PATH):
+        print(f"エラー: モデルファイルが見つかりません: {MODEL_PATH}")
+        print("train.py を実行して、まずモデルを学習させてください。")
+        return
+
     # --- 2. モデルのロード ---
     print(f"学習済みモデルを '{MODEL_PATH}' からロードしています...")
-    # ★ 新しいモデルの器を定義
     model = ViTPanoBEV(vit_model_name=VIT_MODEL_NAME)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.to(device)
@@ -34,25 +38,26 @@ def inference():
     print("モデルのロードが完了しました。")
 
     # --- 3. データローダーの準備 ---
-    # ★ 新しいデータセットを使用
+    # ★ 'test' データセットを使用
+    print(f"'{DATASET_DIR}' からテストデータを読み込んでいます...")
+    if not os.path.isdir(DATASET_DIR) or not os.listdir(os.path.join(DATASET_DIR, 'images')):
+        print(f"エラー: テストデータが見つかりません: {DATASET_DIR}")
+        print("build_dataset.py を実行して、データセットを構築してください。")
+        return
+        
     dataset = PanoBEVDataset(dataset_dir=DATASET_DIR, resize_shape=RESIZE_SHAPE)
-    # 推論なのでシャッフルはFalseでOK
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False) 
 
     # --- 4. 推論と可視化 ---
     print("\n推論を開始します... (ウィンドウを閉じると次の画像が表示されます)")
     
     with torch.no_grad():
-        # ★ データローダーから3つの値を受け取る
         for i, (image, bev_target, depth_target) in enumerate(dataloader):
             image = image.to(device)
             bev_target = bev_target.to(device)
             depth_target = depth_target.to(device)
 
-            # ★ モデルから2つの予測結果を受け取る
             predicted_bev_logits, predicted_depth = model(image)
-            
-            # BEVの予測を確率に変換 (Sigmoidを適用)
             predicted_bev = torch.sigmoid(predicted_bev_logits)
 
             # --- 5. 結果をCPUに戻し、NumPy配列に変換して可視化 ---
@@ -62,7 +67,6 @@ def inference():
             predicted_bev_np = predicted_bev.squeeze().cpu().numpy()
             predicted_depth_np = predicted_depth.squeeze().cpu().numpy()
 
-            # ★ 5つのプロットを作成
             fig, axes = plt.subplots(1, 5, figsize=(25, 5))
             
             axes[0].imshow(image_np, cmap='gray')
@@ -77,20 +81,23 @@ def inference():
             axes[2].set_title('Ground Truth BEV')
             axes[2].axis('off')
 
-            axes[3].imshow(predicted_depth_np, cmap='viridis')
+            im_pred = axes[3].imshow(predicted_depth_np, cmap='viridis')
             axes[3].set_title('Predicted Depth')
             axes[3].axis('off')
+            fig.colorbar(im_pred, ax=axes[3]) # カラーバーを追加
             
-            axes[4].imshow(depth_target_np, cmap='viridis')
+            im_gt = axes[4].imshow(depth_target_np, cmap='viridis')
             axes[4].set_title('Ground Truth Depth')
             axes[4].axis('off')
+            fig.colorbar(im_gt, ax=axes[4]) # カラーバーを追加
             
-            plt.suptitle(f"Inference Result #{i+1}")
+            plt.suptitle(f"Test Result #{i+1}")
             plt.tight_layout()
             plt.show()
 
-            # 5枚表示したら終了
+            # テストセットの全件ではなく、最初の5件だけ表示して終了
             if i >= 4:
+                print("\n最初の5件の表示が完了しました。推論を終了します。")
                 break
 
 if __name__ == '__main__':
