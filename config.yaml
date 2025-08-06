@@ -16,12 +16,12 @@ vit_model_name: 'google/vit-base-patch16-224-in21k'
 
 # --- Training Settings ---
 num_epochs: 1000
-learning_rate: 0.00001 # 1e-5に下げる
-seed: 42 # 再現性のためのシード
+learning_rate: 0.00001  # 0.0001の10分の1に
+seed: 42
 # pos_weightはBEVタスクの不均衡データに対する重み
-# 1.0は重みなし。高くするほど偽陰性を重く罰する
-pos_weight: 1.0
-depth_loss_weight: 1.0
+# 極端な不均衡（0.0184%が正例）に対処するため大きな値を設定
+pos_weight: 25.0  # 50.0から半分に
+depth_loss_weight: 0.1  # 深度の重みを下げてBEVに集中
 
 # --- Augmentation Settings ---
 use_augmentation: true

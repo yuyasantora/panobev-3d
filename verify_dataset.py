@@ -37,6 +37,17 @@ def verify():
     drr_image = np.load(image_path)
     bev_target = np.load(target_path)
 
+    # --- BEVマスクの統計情報を出力 ---
+    print(f"\n=== BEVマスクの統計情報 ===")
+    print(f"Shape: {bev_target.shape}")
+    print(f"Data type: {bev_target.dtype}")
+    print(f"Min value: {np.min(bev_target)}")
+    print(f"Max value: {np.max(bev_target)}")
+    print(f"Mean value: {np.mean(bev_target)}")
+    print(f"Unique values: {np.unique(bev_target)}")
+    print(f"Non-zero pixels: {np.count_nonzero(bev_target)} / {bev_target.size}")
+    print(f"Positive pixels percentage: {100 * np.count_nonzero(bev_target) / bev_target.size:.4f}%")
+
     # --- 可視化 ---
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     

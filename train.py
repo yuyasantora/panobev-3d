@@ -84,6 +84,9 @@ class PanoBEVDataset(Dataset):
         resized_bev = sitk.GetArrayFromImage(resize_image(bev_sitk, sitk.sitkNearestNeighbor))
         resized_depth = sitk.GetArrayFromImage(resize_image(depth_sitk, sitk.sitkLinear))
         
+        # BEVマスクの正規化: 0より大きい値は全て1にする
+        resized_bev = (resized_bev > 0).astype(np.float32)
+        
         epsilon = 1e-6
         if np.max(resized_depth) > epsilon:
             resized_depth = resized_depth / np.max(resized_depth)
@@ -282,7 +285,7 @@ def main(config_path, resume_from=None):
     criterion_bev_dice = DiceLoss().to(device)
     criterion_depth = nn.MSELoss()
     optimizer = AdamW(model.parameters(), lr=config['learning_rate'])
-    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=10, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=3, verbose=True)
 
     # --- 4. Training Loop ---
     best_val_loss = float('inf')
