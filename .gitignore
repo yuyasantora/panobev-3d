@@ -26,3 +26,6 @@ Figure_10.png
 *.pkl.tar
 *.ptl.tar
 *.pth.tar.gz
+
+# project
+experiments/

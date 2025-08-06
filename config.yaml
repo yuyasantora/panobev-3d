@@ -1,0 +1,30 @@
+# config.yaml
+
+# --- Path Settings ---
+data_dir: 'dataset'
+output_dir: 'experiments' # 結果を保存する親ディレクトリ
+
+# --- Dataset Settings ---
+resize_shape: [224, 224]
+
+# --- Dataloader Settings ---
+batch_size: 4
+num_workers: 2
+
+# --- Model Settings ---
+vit_model_name: 'google/vit-base-patch16-224-in21k'
+
+# --- Training Settings ---
+num_epochs: 1000
+learning_rate: 0.00001 # 1e-5に下げる
+seed: 42 # 再現性のためのシード
+# pos_weightはBEVタスクの不均衡データに対する重み
+# 1.0は重みなし。高くするほど偽陰性を重く罰する
+pos_weight: 1.0
+depth_loss_weight: 1.0
+
+# --- Augmentation Settings ---
+use_augmentation: true
+rotation_degrees: 10
+color_jitter_brightness: 0.2
+color_jitter_contrast: 0.2
