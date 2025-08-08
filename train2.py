@@ -312,14 +312,26 @@ def main(config_path, resume_from=None):
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
                 bev_pred, depth_pred = model(images)
-                loss_bev_reg = criterion_bev_reg(bev_pred, bev_cont)
-                loss_bev_grad= grad_loss(bev_pred, bev_cont)
-                loss_bev = loss_bev_reg + bev_grad_weight * loss_bev_grad
+                fg = (bev_bin > 0.5).float()
+                alpha = 0.9  # 前景寄与を強く
+
+                # スカラーへ縮約（バッチ全体で総和→画素数で正規化）
+                diff2 = (bev_pred - bev_cont).pow(2)
+                pos_count = fg.sum()
+                neg_count = (1 - fg).sum()
+                mse_pos = (diff2 * fg).sum() / (pos_count + 1e-6)
+                mse_neg = (diff2 * (1 - fg)).sum() / (neg_count + 1e-6)
+                loss_bev_reg = alpha * mse_pos + (1 - alpha) * mse_neg
+
+                loss_bev_grad = grad_loss(bev_pred, bev_cont)
                 loss_depth = criterion_depth(depth_pred, depth_tgt)
-                total_loss = loss_bev + depth_loss_weight * loss_depth
+                total_loss = loss_bev_reg + bev_grad_weight * loss_bev_grad + depth_loss_weight * loss_depth
+
             scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)  # クリップはunscale後に
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer); scaler.update()
+            scaler.step(optimizer)
+            scaler.update()
             train_loss += total_loss.item()
 
         # Val
@@ -347,6 +359,9 @@ def main(config_path, resume_from=None):
                     d = thresh_dice(bev_pred[nz], bev_bin[nz], th=0.3)
                     dice_nz_sum += d
                     nz_batches += 1
+
+                p = bev_pred
+                print(f"val p.mean={p.mean().item():.6f}, p.max={p.max().item():.6f}")
 
         avg_train = train_loss / max(1, len(train_loader))
         avg_val   = val_loss   / max(1, len(val_loader))

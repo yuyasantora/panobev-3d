@@ -15,7 +15,7 @@ num_workers: 2
 vit_model_name: 'google/vit-base-patch16-224-in21k'
 
 # --- Training Settings ---
-num_epochs: 100
+num_epochs: 1000
 learning_rate: 0.00001  # 0.0001の10分の1に
 seed: 42
 # pos_weightはBEVタスクの不均衡データに対する重み
@@ -28,3 +28,8 @@ use_augmentation: false
 rotation_degrees: 10
 color_jitter_brightness: 0.2
 color_jitter_contrast: 0.2
+
+# --- BEV Settings ---
+bev_target_mode: 'gaussian'
+bev_gaussian_sigma: 3.0
+bev_grad_weight: 0.5
