@@ -15,16 +15,16 @@ num_workers: 2
 vit_model_name: 'google/vit-base-patch16-224-in21k'
 
 # --- Training Settings ---
-num_epochs: 1000
+num_epochs: 100
 learning_rate: 0.00001  # 0.0001の10分の1に
 seed: 42
 # pos_weightはBEVタスクの不均衡データに対する重み
 # 極端な不均衡（0.0184%が正例）に対処するため大きな値を設定
-pos_weight: 25.0  # 50.0から半分に
-depth_loss_weight: 0.1  # 深度の重みを下げてBEVに集中
+pos_weight: 200        # いまはFocal使用のため未使用（実験名にのみ反映）
+depth_loss_weight: 0.0 # BEVに全集中
 
 # --- Augmentation Settings ---
-use_augmentation: true
+use_augmentation: false
 rotation_degrees: 10
 color_jitter_brightness: 0.2
 color_jitter_contrast: 0.2

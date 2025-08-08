@@ -91,7 +91,16 @@ class PanoBEVDataset(Dataset):
         if np.max(resized_depth) > epsilon:
             resized_depth = resized_depth / np.max(resized_depth)
         
-        image_tensor = torch.from_numpy(resized_image).float().unsqueeze(0)
+        # resized_image (np.ndarray) を得た直後あたり
+        image = resized_image.astype(np.float32)
+        m, M = image.min(), image.max()
+        if M > m:
+            image = (image - m) / (M - m)         # [0,1]
+        else:
+            image = np.zeros_like(image, dtype=np.float32)
+        image = (image - 0.5) / 0.5               # [-1,1]
+
+        image_tensor = torch.from_numpy(image).float().unsqueeze(0)
         bev_tensor = torch.from_numpy(resized_bev).float().unsqueeze(0)
         depth_tensor = torch.from_numpy(resized_depth).float().unsqueeze(0)
 
@@ -128,7 +137,7 @@ class ViTPanoBEV(nn.Module):
 
             def forward(self, x, skip_x):
                 x = self.up(x)
-                if skip_x.shape[1] != x.shape[2:]:
+                if skip_x.shape[2:] != x.shape[2:]:
                     skip_x = nn.functional.interpolate(skip_x, size=x.shape[2:], mode='bilinear', align_corners=False)
                 x = torch.cat([x, skip_x], dim=1)
                 return self.conv(x)
@@ -209,6 +218,28 @@ class DiceLoss(nn.Module):
         dice_score = (2. * intersection + self.epsilon) / (union + self.epsilon)
         return 1. - dice_score.mean()
 
+class TverskyLoss(nn.Module):
+    def __init__(self, alpha=0.7, beta=0.3, epsilon=1e-6):
+        super().__init__()
+        self.alpha, self.beta, self.epsilon = alpha, beta, epsilon
+    def forward(self, predicted, target):
+        p = torch.sigmoid(predicted)
+        tp = (p*target).sum(dim=(2,3))
+        fp = (p*(1-target)).sum(dim=(2,3))
+        fn = ((1-p)*target).sum(dim=(2,3))
+        tversky = (tp + self.epsilon) / (tp + self.alpha*fp + self.beta*fn + self.epsilon)
+        return 1. - tversky.mean()
+
+class FocalWithLogitsLoss(nn.Module):
+    def __init__(self, alpha=0.99, gamma=2.0, reduction='mean'):
+        super().__init__(); self.alpha, self.gamma, self.reduction = alpha, gamma, reduction
+    def forward(self, logits, targets):
+        bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        p = torch.sigmoid(logits)
+        p_t = p*targets + (1-p)*(1-targets)
+        loss = self.alpha * (1 - p_t).pow(self.gamma) * bce
+        return loss.mean() if self.reduction=='mean' else loss.sum()
+
 # ===================================================================
 # Metrics
 # ===================================================================
@@ -221,6 +252,19 @@ def calculate_dice_coefficient(predicted, target, epsilon=1e-6):
 
 def calculate_rmse(predicted, target):
     return torch.sqrt(nn.functional.mse_loss(predicted, target)).item()
+
+def soft_dice(pred, tgt, eps=1e-6):
+    p = torch.sigmoid(pred)
+    inter = (p * tgt).sum()
+    union = p.sum() + tgt.sum()
+    return (2*inter + eps) / (union + eps)
+
+def thresh_dice(pred, tgt, th=0.5, eps=1e-6):
+    pm = (torch.sigmoid(pred) > th).float()
+    tm = (tgt > 0.5).float()
+    inter = (pm * tm).sum()
+    union = pm.sum() + tm.sum()
+    return (2*inter + eps) / (union + eps)
 
 # ===================================================================
 # Main Training Function
@@ -280,11 +324,22 @@ def main(config_path, resume_from=None):
         else:
             print(f"Warning: --resume_from was specified, but best_model.pth not found in {resume_from}. Starting from scratch.")
 
-    pos_weight_tensor = torch.tensor([config['pos_weight']]).to(device)
-    criterion_bev_bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-    criterion_bev_dice = DiceLoss().to(device)
+    criterion_bev_bce = FocalWithLogitsLoss(alpha=0.99, gamma=2.0)
+    criterion_bev_dice = TverskyLoss(alpha=0.7, beta=0.3).to(device)
     criterion_depth = nn.MSELoss()
-    optimizer = AdamW(model.parameters(), lr=config['learning_rate'])
+    
+    head_params = list(model.bottleneck.parameters()) + \
+                  list(model.decoder4.parameters()) + \
+                  list(model.decoder3.parameters()) + \
+                  list(model.decoder2.parameters()) + \
+                  list(model.final_conv.parameters()) + \
+                  list(model.bev_head.parameters()) + \
+                  list(model.depth_head.parameters())
+
+    optimizer = AdamW([
+        {'params': model.vit.parameters(), 'lr': 1e-5},
+        {'params': head_params, 'lr': 1e-3},
+    ])
     scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=3, verbose=True)
 
     # --- 4. Training Loop ---
@@ -300,9 +355,18 @@ def main(config_path, resume_from=None):
             optimizer.zero_grad()
             predicted_bev, predicted_depth = model(images)
             
+            # train/val ループ内で bev_targets から膨張版を作る
+            bev_targets_dil = torch.clamp(
+                nn.functional.max_pool2d(bev_targets, kernel_size=5, stride=1, padding=2), 0, 1
+            )
+
+            # 損失は両方で平均
             loss_bce = criterion_bev_bce(predicted_bev, bev_targets)
-            loss_dice = criterion_bev_dice(predicted_bev, bev_targets)
-            loss_bev = loss_bce + loss_dice
+            loss_bce_d = criterion_bev_bce(predicted_bev, bev_targets_dil)
+            loss_tv  = criterion_bev_dice(predicted_bev, bev_targets)
+            loss_tv_d= criterion_bev_dice(predicted_bev, bev_targets_dil)
+            # 現状の平均から、最初は dilated を重めに
+            loss_bev = 0.2*(loss_bce + loss_tv) + 0.8*(loss_bce_d + loss_tv_d)
 
             loss_depth = criterion_depth(predicted_depth, depth_targets)
             total_loss = loss_bev + config['depth_loss_weight'] * loss_depth
@@ -319,6 +383,11 @@ def main(config_path, resume_from=None):
                 images, bev_targets, depth_targets = [b.to(device) for b in batch]
                 predicted_bev, predicted_depth = model(images)
 
+                # train/val ループ内で bev_targets から膨張版を作る
+                bev_targets_dil = torch.clamp(
+                    nn.functional.max_pool2d(bev_targets, kernel_size=5, stride=1, padding=2), 0, 1
+                )
+
                 bce_loss_item = criterion_bev_bce(predicted_bev, bev_targets).item()
                 dice_loss_item = criterion_bev_dice(predicted_bev, bev_targets).item()
                 bev_loss_item = bce_loss_item + dice_loss_item
@@ -330,6 +399,24 @@ def main(config_path, resume_from=None):
 
                 val_dice += calculate_dice_coefficient(predicted_bev, bev_targets)
                 val_rmse += calculate_rmse(predicted_depth, depth_targets)
+
+                # Validation ループ内、集計の直前/直後に
+                tgt_non_empty = (bev_targets.sum(dim=(2,3)) > 0).float()  # [B,1,1]でもOK
+                dice_soft = soft_dice(predicted_bev, bev_targets).item()
+
+                ths = [0.05, 0.1, 0.2, 0.3, 0.5]
+                dice_list = [thresh_dice(predicted_bev, bev_targets, th).item() for th in ths]
+
+                nz = (bev_targets.sum(dim=(2,3)) > 0)
+                dice_nz = [thresh_dice(predicted_bev[nz], bev_targets[nz], th).item() if nz.any() else 0.0 for th in ths]
+                print(f"Val soft-Dice={dice_soft:.4f}, Dice@{ths}={[f'{d:.4f}' for d in dice_list]}, DiceNZ@{ths}={[f'{d:.4f}' for d in dice_nz]} (nz_ratio={(nz.float().mean().item()):.3f})")
+
+                # 検証時の数値をサニティチェック（バッチ平均が妥当か）
+                p = torch.sigmoid(predicted_bev)
+                print(f"val p.mean={p.mean().item():.6f}, p.max={p.max().item():.6f}")
+                b = torch.sigmoid(predicted_bev)
+                pos_rate = (b > 0.5).float().mean().item()
+                # print(f"val batch pos_rate={pos_rate:.6f}, bce={bce_loss_item:.6f}, dice={dice_loss_item:.6f}")
 
         # Logging
         avg_train_loss = train_loss / len(train_loader)
