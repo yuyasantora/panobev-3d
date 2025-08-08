@@ -266,6 +266,33 @@ def thresh_dice(pred, tgt, th=0.5, eps=1e-6):
     union = pm.sum() + tm.sum()
     return (2*inter + eps) / (union + eps)
 
+class AutoTune:
+    def __init__(self, patience=5, min_delta=1e-3):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best = 0.0
+        self.bad_epochs = 0
+
+    def step(self, avg_dice_nz: float):
+        decisions = {}
+        improved = avg_dice_nz > self.best + self.min_delta
+        if improved:
+            self.best = avg_dice_nz
+            self.bad_epochs = 0
+            decisions['decay_dilation'] = True  # 改善時は徐々に厳しく戻す
+        else:
+            self.bad_epochs += 1
+
+        if self.bad_epochs >= self.patience:
+            decisions.update({
+                'bump_head_lr': True,
+                'lower_focal_gamma': True,
+                'shift_tversky': True,
+                'increase_dilation': True,
+            })
+            self.bad_epochs = 0
+        return decisions
+
 # ===================================================================
 # Main Training Function
 # ===================================================================
@@ -337,10 +364,15 @@ def main(config_path, resume_from=None):
                   list(model.depth_head.parameters())
 
     optimizer = AdamW([
-        {'params': model.vit.parameters(), 'lr': 1e-5},
-        {'params': head_params, 'lr': 1e-3},
+        {'params': model.vit.parameters(), 'lr': 1e-5, 'name': 'enc'},
+        {'params': head_params,           'lr': 1e-3, 'name': 'head'},
     ])
-    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=3, verbose=True)
+    # DiceNZベースのスケジューラに変更
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, verbose=True)
+
+    # main() 内、criterion作成後あたり
+    autotune = AutoTune(patience=5, min_delta=1e-3)
+    dilate_cfg = {'k': 5, 'w_dil': 0.8, 'w_orig': 0.2}  # 初期: 膨張寄与高め
 
     # --- 4. Training Loop ---
     best_val_loss = float('inf')
@@ -357,16 +389,16 @@ def main(config_path, resume_from=None):
             
             # train/val ループ内で bev_targets から膨張版を作る
             bev_targets_dil = torch.clamp(
-                nn.functional.max_pool2d(bev_targets, kernel_size=5, stride=1, padding=2), 0, 1
+                nn.functional.max_pool2d(bev_targets, kernel_size=dilate_cfg['k'], stride=1, padding=dilate_cfg['k']//2), 0, 1
             )
 
             # 損失は両方で平均
-            loss_bce = criterion_bev_bce(predicted_bev, bev_targets)
-            loss_bce_d = criterion_bev_bce(predicted_bev, bev_targets_dil)
-            loss_tv  = criterion_bev_dice(predicted_bev, bev_targets)
-            loss_tv_d= criterion_bev_dice(predicted_bev, bev_targets_dil)
+            loss_bce  = criterion_bev_bce(predicted_bev, bev_targets)
+            loss_bce_d= criterion_bev_bce(predicted_bev, bev_targets_dil)
+            loss_tv   = criterion_bev_dice(predicted_bev, bev_targets)
+            loss_tv_d = criterion_bev_dice(predicted_bev, bev_targets_dil)
             # 現状の平均から、最初は dilated を重めに
-            loss_bev = 0.2*(loss_bce + loss_tv) + 0.8*(loss_bce_d + loss_tv_d)
+            loss_bev  = dilate_cfg['w_orig']*(loss_bce + loss_tv) + dilate_cfg['w_dil']*(loss_bce_d + loss_tv_d)
 
             loss_depth = criterion_depth(predicted_depth, depth_targets)
             total_loss = loss_bev + config['depth_loss_weight'] * loss_depth
@@ -385,7 +417,7 @@ def main(config_path, resume_from=None):
 
                 # train/val ループ内で bev_targets から膨張版を作る
                 bev_targets_dil = torch.clamp(
-                    nn.functional.max_pool2d(bev_targets, kernel_size=5, stride=1, padding=2), 0, 1
+                    nn.functional.max_pool2d(bev_targets, kernel_size=dilate_cfg['k'], stride=1, padding=dilate_cfg['k']//2), 0, 1
                 )
 
                 bce_loss_item = criterion_bev_bce(predicted_bev, bev_targets).item()
@@ -406,10 +438,13 @@ def main(config_path, resume_from=None):
 
                 ths = [0.05, 0.1, 0.2, 0.3, 0.5]
                 dice_list = [thresh_dice(predicted_bev, bev_targets, th).item() for th in ths]
-
                 nz = (bev_targets.sum(dim=(2,3)) > 0)
-                dice_nz = [thresh_dice(predicted_bev[nz], bev_targets[nz], th).item() if nz.any() else 0.0 for th in ths]
-                print(f"Val soft-Dice={dice_soft:.4f}, Dice@{ths}={[f'{d:.4f}' for d in dice_list]}, DiceNZ@{ths}={[f'{d:.4f}' for d in dice_nz]} (nz_ratio={(nz.float().mean().item()):.3f})")
+                dice_nz_list = [thresh_dice(predicted_bev[nz], bev_targets[nz], th).item() if nz.any() else 0.0 for th in ths]
+                avg_dice_nz = thresh_dice(predicted_bev[nz], bev_targets[nz], th=0.3).item() if nz.any() else 0.0
+
+                print(f"Val soft-Dice={dice_soft:.4f}, Dice@{ths}={[f'{d:.4f}' for d in dice_list]}, "
+                      f"DiceNZ@{ths}={[f'{d:.4f}' for d in dice_nz_list]} (nz_ratio={(nz.float().mean().item()):.3f})")
+                print(f"Avg DiceNZ@0.3: {avg_dice_nz:.4f} (nz_batches={int(nz.any().item())})")
 
                 # 検証時の数値をサニティチェック（バッチ平均が妥当か）
                 p = torch.sigmoid(predicted_bev)
@@ -430,13 +465,38 @@ def main(config_path, resume_from=None):
               f"Val Dice: {avg_val_dice:.4f}, Val RMSE: {avg_val_rmse:.4f}")
 
         # Learning rate scheduler step
-        scheduler.step(avg_val_loss)
+        scheduler.step(avg_dice_nz)  # DiceNZベースでLR制御
 
         # Save best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), os.path.join(exp_dir, "best_model.pth"))
             print(f"  -> Best model saved with Val Loss: {best_val_loss:.4f}")
+
+        # オートチューニングの実行
+        decisions = autotune.step(avg_dice_nz)
+        if decisions.get('lower_focal_gamma'):
+            criterion_bev_bce.gamma = max(1.2, criterion_bev_bce.gamma - 0.2)
+        if decisions.get('shift_tversky'):
+            # alphaを下げ、betaを上げてFNを強く罰する（範囲を拘束）
+            criterion_bev_dice.alpha = max(0.2, criterion_bev_dice.alpha - 0.1)
+            criterion_bev_dice.beta  = min(0.8, criterion_bev_dice.beta  + 0.1)
+        if decisions.get('increase_dilation'):
+            dilate_cfg['k']    = min(9, dilate_cfg['k'] + 2)
+            dilate_cfg['w_dil']= min(0.9, dilate_cfg['w_dil'] + 0.1)
+            dilate_cfg['w_orig']= 1.0 - dilate_cfg['w_dil']
+        if decisions.get('decay_dilation'):
+            dilate_cfg['w_dil']= max(0.2, dilate_cfg['w_dil'] - 0.1)
+            dilate_cfg['w_orig']= 1.0 - dilate_cfg['w_dil']
+            if dilate_cfg['k'] > 5:  # ゆっくり戻す
+                dilate_cfg['k'] -= 2
+        if decisions.get('bump_head_lr'):
+            for pg in optimizer.param_groups:
+                if pg.get('name') == 'head':
+                    pg['lr'] = min(pg['lr'] * 1.5, 2e-3)  # 上限
+        print(f"[AutoTune] gamma={criterion_bev_bce.gamma:.2f}, "
+              f"tversky(a,b)=({criterion_bev_dice.alpha:.2f},{criterion_bev_dice.beta:.2f}), "
+              f"dilate(k={dilate_cfg['k']}, w_dil={dilate_cfg['w_dil']:.2f}), head_lr={next(pg['lr'] for pg in optimizer.param_groups if pg.get('name')=='head'):.1e}")
 
 # ===================================================================
 # Script Entry Point
