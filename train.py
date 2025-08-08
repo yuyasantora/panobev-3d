@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 import torchvision.transforms as T
 import argparse
+from torch.utils.data import WeightedRandomSampler
 
 def set_seed(seed):
     """乱数シードを固定して再現性を確保する"""
@@ -336,7 +337,13 @@ def main(config_path, resume_from=None):
         resize_shape=config['resize_shape'], 
         augmentation_config={'use_augmentation': False} # Validation set should not be augmented
     )
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
+    # train.py の DataLoader 生成前に
+    # 非空サンプルの重みを上げる
+    weights = [3.0 if (np.load(os.path.join(train_dataset.target_dir, f"{f.split('_')[0]}_bev.npy")) > 0).any() else 1.0 
+          for f in train_dataset.image_files]
+    sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], 
+                         sampler=sampler, num_workers=config['num_workers'])
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
 
     # --- 3. Model, Loss, Optimizer ---
@@ -351,8 +358,8 @@ def main(config_path, resume_from=None):
         else:
             print(f"Warning: --resume_from was specified, but best_model.pth not found in {resume_from}. Starting from scratch.")
 
-    criterion_bev_bce = FocalWithLogitsLoss(alpha=0.99, gamma=2.0)
-    criterion_bev_dice = TverskyLoss(alpha=0.7, beta=0.3).to(device)
+    criterion_bev_bce = FocalWithLogitsLoss(alpha=0.99, gamma=1.5)  # gamma: 2.0→1.5
+    criterion_bev_dice = TverskyLoss(alpha=0.3, beta=0.7)  # FN重視の方向へ
     criterion_depth = nn.MSELoss()
     
     head_params = list(model.bottleneck.parameters()) + \
@@ -363,16 +370,17 @@ def main(config_path, resume_from=None):
                   list(model.bev_head.parameters()) + \
                   list(model.depth_head.parameters())
 
+    # オプティマイザ作成部
     optimizer = AdamW([
-        {'params': model.vit.parameters(), 'lr': 1e-5, 'name': 'enc'},
-        {'params': head_params,           'lr': 1e-3, 'name': 'head'},
+        {'params': model.vit.parameters(), 'lr': 5e-6, 'name': 'enc'},
+        {'params': head_params,           'lr': 2e-3, 'name': 'head'},
     ])
     # DiceNZベースのスケジューラに変更
     scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, verbose=True)
 
     # main() 内、criterion作成後あたり
     autotune = AutoTune(patience=5, min_delta=1e-3)
-    dilate_cfg = {'k': 5, 'w_dil': 0.8, 'w_orig': 0.2}  # 初期: 膨張寄与高め
+    dilate_cfg = {'k': 11, 'w_dil': 0.9, 'w_orig': 0.1}  # より強めの膨張から開始
 
     # --- 4. Training Loop ---
     best_val_loss = float('inf')
@@ -491,12 +499,20 @@ def main(config_path, resume_from=None):
             if dilate_cfg['k'] > 5:  # ゆっくり戻す
                 dilate_cfg['k'] -= 2
         if decisions.get('bump_head_lr'):
-            for pg in optimizer.param_groups:
-                if pg.get('name') == 'head':
-                    pg['lr'] = min(pg['lr'] * 1.5, 2e-3)  # 上限
+            head_pg = next((pg for pg in optimizer.param_groups if pg.get('name')=='head'), None)
+            if head_pg is None:
+                head_pg = optimizer.param_groups[-1]  # フォールバック
+            head_pg['lr'] = min(head_pg['lr'] * 1.5, 2e-3)  # 上限
+        # print行の直前で安全に取得
+        head_pg = next((pg for pg in optimizer.param_groups if pg.get('name')=='head'), None)
+        enc_pg  = next((pg for pg in optimizer.param_groups if pg.get('name')=='enc'), None)
+        head_lr = (head_pg['lr'] if head_pg else optimizer.param_groups[-1]['lr'])
+        enc_lr  = (enc_pg['lr']  if enc_pg  else optimizer.param_groups[0]['lr'])
+
         print(f"[AutoTune] gamma={criterion_bev_bce.gamma:.2f}, "
               f"tversky(a,b)=({criterion_bev_dice.alpha:.2f},{criterion_bev_dice.beta:.2f}), "
-              f"dilate(k={dilate_cfg['k']}, w_dil={dilate_cfg['w_dil']:.2f}), head_lr={next(pg['lr'] for pg in optimizer.param_groups if pg.get('name')=='head'):.1e}")
+              f"dilate(k={dilate_cfg['k']}, w_dil={dilate_cfg['w_dil']:.2f}), "
+              f"enc_lr={enc_lr:.1e}, head_lr={head_lr:.1e}")
 
 # ===================================================================
 # Script Entry Point

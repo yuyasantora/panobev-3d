@@ -15,6 +15,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 import argparse
+from torch.utils.data import WeightedRandomSampler
 
 def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -257,8 +258,18 @@ def main(config_path, resume_from=None):
         augmentation_config={'use_augmentation': False},
         bev_cfg=bev_cfg
     )
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
-    val_loader   = DataLoader(val_dataset,   batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'])
+    train_target_dir = os.path.join(config['data_dir'], 'train', 'targets')
+    weights = []
+    for f in train_dataset.image_files:
+        pid = f.replace('.npy','').split('_')[0]
+        bev = np.load(os.path.join(train_target_dir, f"{pid}_bev.npy"))
+        weights.append(3.0 if (bev > 0).any() else 1.0)
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'],
+                          sampler=sampler, shuffle=False, num_workers=config['num_workers'], pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=config['batch_size'],
+                          shuffle=False, num_workers=config['num_workers'], pin_memory=True)
 
     # Model
     model = ViTPanoBEV2(vit_model_name=config['vit_model_name']).to(device)
@@ -289,7 +300,9 @@ def main(config_path, resume_from=None):
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
 
     # Train
+    patience, bad = 8, 0
     best_val = float('inf')
+    scaler = torch.cuda.amp.GradScaler()
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
         model.train()
@@ -297,17 +310,16 @@ def main(config_path, resume_from=None):
         for batch in tqdm(train_loader, desc="Training"):
             images, bev_cont, depth_tgt, bev_bin = [b.to(device) for b in batch]
             optimizer.zero_grad()
-            bev_pred, depth_pred = model(images)
-
-            loss_bev_reg = criterion_bev_reg(bev_pred, bev_cont)
-            loss_bev_grad= grad_loss(bev_pred, bev_cont)
-            loss_bev = loss_bev_reg + bev_grad_weight * loss_bev_grad
-
-            loss_depth = criterion_depth(depth_pred, depth_tgt)
-            total_loss = loss_bev + depth_loss_weight * loss_depth
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            with torch.cuda.amp.autocast():
+                bev_pred, depth_pred = model(images)
+                loss_bev_reg = criterion_bev_reg(bev_pred, bev_cont)
+                loss_bev_grad= grad_loss(bev_pred, bev_cont)
+                loss_bev = loss_bev_reg + bev_grad_weight * loss_bev_grad
+                loss_depth = criterion_depth(depth_pred, depth_tgt)
+                total_loss = loss_bev + depth_loss_weight * loss_depth
+            scaler.scale(total_loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer); scaler.update()
             train_loss += total_loss.item()
 
         # Val
@@ -347,12 +359,16 @@ def main(config_path, resume_from=None):
               f"Val BEV(reg): {avg_bev_r:.4f}, Val BEV(grad): {avg_bev_g:.4f}, "
               f"Val Depth: {avg_dep:.4f}, Avg DiceNZ@0.3: {avg_dice_nz:.4f} (nz_batches={nz_batches})")
 
-        scheduler.step(avg_val)
+        # depth_loss_weightが0でない運用も想定し、BEVのみでLRを下げる
+        scheduler.step(avg_bev_r + bev_grad_weight * avg_bev_g)
 
-        if avg_val < best_val:
-            best_val = avg_val
+        if avg_val < best_val - 1e-4:
+            best_val = avg_val; bad = 0
             torch.save(model.state_dict(), os.path.join(exp_dir, "best_model.pth"))
-            print(f"  -> Best model saved with Val Loss: {best_val:.4f}")
+        else:
+            bad += 1
+            if bad >= patience: 
+                print("Early stop."); break
 
 if __name__ == '__main__':
     if os.name == 'nt':
