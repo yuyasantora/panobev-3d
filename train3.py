@@ -117,70 +117,83 @@ class PanoBEVDataset3(Dataset):
 # ===================================================================
 # Model (same as train2)
 # ===================================================================
-class ViTPanoBEV3(nn.Module):
+class ViTPanoBEV3_MultiScale(nn.Module):
     def __init__(self, vit_model_name, output_size=224):
         super().__init__()
         self.vit = ViTModel.from_pretrained(vit_model_name, output_hidden_states=True)
         self.hidden_size = self.vit.config.hidden_size
-        self.output_size = output_size  # 追加
+        self.output_size = output_size
 
-        class DecoderBlock(nn.Module):
-            def __init__(self, in_channels, skip_channels, out_channels):
-                super().__init__()
-                self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-                self.conv = nn.Sequential(
-                    nn.Conv2d(out_channels + skip_channels, out_channels, kernel_size=3, padding=1),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-                    nn.ReLU(inplace=True)
-                )
-            def forward(self, x, skip_x):
-                x = self.up(x)
-                if skip_x.shape[2:] != x.shape[2:]:
-                    skip_x = F.interpolate(skip_x, size=x.shape[2:], mode='bilinear', align_corners=False)
-                x = torch.cat([x, skip_x], dim=1)
-                return self.conv(x)
+        # 各スケールの特徴変換
+        self.scale_convs = nn.ModuleList([
+            nn.Conv2d(self.hidden_size, 256, 1),  # 細部 (layer 4)
+            nn.Conv2d(self.hidden_size, 256, 1),  # 中間 (layer 8)
+            nn.Conv2d(self.hidden_size, 256, 1)   # 大域 (layer 12)
+        ])
 
-        self.bottleneck = nn.Conv2d(self.hidden_size, 512, kernel_size=1)
-        self.decoder4 = DecoderBlock(512, self.hidden_size, 256)
-        self.decoder3 = DecoderBlock(256, self.hidden_size, 128)
-        self.decoder2 = DecoderBlock(128, self.hidden_size, 64)
-        self.final_conv = nn.ConvTranspose2d(64, 16, kernel_size=2, stride=2)
-        self.bev_head = nn.Conv2d(16, 1, kernel_size=1)
-        self.depth_head = nn.Conv2d(16, 1, kernel_size=1)
+        # 特徴融合
+        self.fusion = nn.Sequential(
+            nn.Conv2d(256*3, 256, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.ReLU()
+        )
+
+        # デコーダーは軽量化（既に融合済みの特徴を使用）
+        self.decoder = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.ReLU()
+        )
+
+        # 出力ヘッド
+        self.bev_head = nn.Conv2d(32, 1, 1)
+        self.depth_head = nn.Conv2d(32, 1, 1)
 
     def forward(self, x):
+        # 入力処理
         if x.shape[1] == 1:
             x = x.repeat(1, 3, 1, 1)
 
-        vit_outputs = self.vit(x)
-        hidden_states = vit_outputs.hidden_states
+        # ViT特徴抽出
+        outputs = self.vit(x)
+        hidden_states = outputs.hidden_states
 
-        bsz = x.shape[0]
-        patch = self.vit.config.patch_size
-        fmap = x.shape[2] // patch
+        # 各スケールの特徴を抽出・処理
+        features = []
+        for i, layer_idx in enumerate([4, 8, 12]):
+            # hidden_statesから特徴マップを復元
+            h = hidden_states[layer_idx]
+            B = h.shape[0]
+            h = h[:, 1:].transpose(1, 2).reshape(B, self.hidden_size, 14, 14)
+            
+            # スケール特徴の変換
+            h = self.scale_convs[i](h)
+            
+            # サイズ調整
+            if i > 0:  # 中間・大域特徴を細部特徴のサイズに合わせる
+                h = F.interpolate(h, size=(14, 14), mode='bilinear', align_corners=False)
+            
+            features.append(h)
 
-        skip1 = hidden_states[1][:, 1:].permute(0,2,1).reshape(bsz, self.hidden_size, fmap, fmap)
-        skip2 = hidden_states[4][:, 1:].permute(0,2,1).reshape(bsz, self.hidden_size, fmap, fmap)
-        skip3 = hidden_states[8][:, 1:].permute(0,2,1).reshape(bsz, self.hidden_size, fmap, fmap)
-        bott  = hidden_states[-1][:, 1:].permute(0,2,1).reshape(bsz, self.hidden_size, fmap, fmap)
+        # 特徴融合
+        fused = self.fusion(torch.cat(features, dim=1))
+        
+        # デコード
+        decoded = self.decoder(fused)
 
-        x = self.bottleneck(bott)
-        x = self.decoder4(x, skip3)
-        x = self.decoder3(x, skip2)
-        x = self.decoder2(x, skip1)
-        x = self.final_conv(x)
+        # 最終出力
+        bev = self.bev_head(decoded)
+        depth = self.depth_head(decoded)
 
-        bev = self.bev_head(x)
-        depth = self.depth_head(x)
+        # サイズ調整とシグモイド
+        bev = F.interpolate(bev, size=(self.output_size, self.output_size), 
+                          mode='bilinear', align_corners=False)
+        depth = F.interpolate(depth, size=(self.output_size, self.output_size), 
+                            mode='bilinear', align_corners=False)
 
-        # config で指定されたサイズに合わせる
-        bev  = F.interpolate(bev,  size=(self.output_size, self.output_size), mode='bilinear', align_corners=False)
-        depth= F.interpolate(depth, size=(self.output_size, self.output_size), mode='bilinear', align_corners=False)
-
-        bev = torch.sigmoid(bev)
-        depth = torch.sigmoid(depth)
-        return bev, depth
+        return torch.sigmoid(bev), torch.sigmoid(depth)
 
 # ===================================================================
 # Loss/metrics (optimized for dense targets)
@@ -315,7 +328,7 @@ def main(config_path, resume_from=None):
                           shuffle=False, num_workers=config['num_workers'], pin_memory=True)
 
     # Model
-    model = ViTPanoBEV3(
+    model = ViTPanoBEV3_MultiScale(
         vit_model_name=config['vit_model_name'],
         output_size=config['resize_shape'][0]  # 384を渡す
     ).to(device)
@@ -332,11 +345,9 @@ def main(config_path, resume_from=None):
     dice_loss_weight  = float(config.get('dice_loss_weight', 0.2))   # 軽めに
 
     # Optimizer (encoder low LR, heads high LR)
-    head_params = list(model.bottleneck.parameters()) + \
-                  list(model.decoder4.parameters()) + \
-                  list(model.decoder3.parameters()) + \
-                  list(model.decoder2.parameters()) + \
-                  list(model.final_conv.parameters()) + \
+    head_params = list(model.scale_convs.parameters()) + \
+                  list(model.fusion.parameters()) + \
+                  list(model.decoder.parameters()) + \
                   list(model.bev_head.parameters()) + \
                   list(model.depth_head.parameters())
     optimizer = AdamW([

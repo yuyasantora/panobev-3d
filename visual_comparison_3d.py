@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import yaml
 import SimpleITK as sitk
-from train3 import ViTPanoBEV3, PanoBEVDataset3
+from train3 import  PanoBEVDataset3, ViTPanoBEV3_MultiScale
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.ndimage import label, binary_closing, binary_opening
@@ -259,6 +259,30 @@ def bev_depth_to_3d_points_improved(bev_pred, depth_pred, ct_image, threshold=0.
     points_3d = np.stack([x_coords, y_coords, z_coords], axis=1)
     return points_3d
 
+def post_process_predicted_points(pred_points, min_cluster_size=1000):
+    """予測点群の後処理（GTと同等の品質向上）"""
+    if len(pred_points) == 0:
+        return pred_points
+    
+    from sklearn.cluster import DBSCAN
+    
+    # 1. クラスタリングで離散点を除去
+    clustering = DBSCAN(eps=5.0, min_samples=50)
+    labels = clustering.fit_predict(pred_points)
+    
+    # 2. 最大クラスタのみ保持（主要な肺野構造）
+    unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
+    if len(unique_labels) == 0:
+        return pred_points
+    
+    # 大きなクラスタを選択
+    large_clusters = unique_labels[counts > min_cluster_size]
+    if len(large_clusters) == 0:
+        return pred_points
+    
+    mask = np.isin(labels, large_clusters)
+    return pred_points[mask]
+
 def visualize_gt_vs_prediction(patient_id, model_path, config_path, data_dir, lidc_root):
     """GT vs 予測の視覚比較"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -267,7 +291,7 @@ def visualize_gt_vs_prediction(patient_id, model_path, config_path, data_dir, li
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     
-    model = ViTPanoBEV3(config['vit_model_name']).to(device)
+    model = ViTPanoBEV3_MultiScale(config['vit_model_name']).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     
@@ -319,6 +343,7 @@ def visualize_gt_vs_prediction(patient_id, model_path, config_path, data_dir, li
     # 予測3D生成
     print("Generating predicted 3D...")
     pred_points = bev_depth_to_3d_points_improved(bev_pred, depth_pred, ct_image)
+    pred_points = post_process_predicted_points(pred_points)  # 後処理追加
     
     print(f"GT points: {len(gt_points)}, Predicted points: {len(pred_points)}")
     
@@ -375,7 +400,7 @@ def visualize_gt_vs_prediction(patient_id, model_path, config_path, data_dir, li
 
 if __name__ == '__main__':
     patient_id = 'LIDC-IDRI-0005'
-    model_path = 'experiments_lung/250820_1100_lungBEV_lr5e-06/best_model.pth'
+    model_path = 'experiments_lung/250820_1456_lungBEV_lr5e-06/best_model.pth'
     config_path = 'config_lung.yaml'
     data_dir = 'dataset_lung'
     lidc_root = 'data/manifest-1752629384107/LIDC-IDRI/'  # 調整してください
