@@ -131,25 +131,35 @@ class ViTPanoBEV3_MultiScale(nn.Module):
             nn.Conv2d(self.hidden_size, 256, 1)   # 大域 (layer 12)
         ])
 
-        # 特徴融合
+        # 強化された特徴融合
         self.fusion = nn.Sequential(
             nn.Conv2d(256*3, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.Conv2d(256, 128, 3, padding=1),
-            nn.ReLU()
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.Conv2d(256, 128, 1)
         )
 
-        # デコーダーは軽量化（既に融合済みの特徴を使用）
+        # デコーダー
         self.decoder = nn.Sequential(
             nn.Conv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU()
         )
 
-        # 出力ヘッド
+        # 改良された出力ヘッド
         self.bev_head = nn.Conv2d(32, 1, 1)
-        self.depth_head = nn.Conv2d(32, 1, 1)
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 1, 1)
+        )
 
     def forward(self, x):
         # 入力処理
