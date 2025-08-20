@@ -154,8 +154,12 @@ class ViTPanoBEV3_MultiScale(nn.Module):
 
         # 改良された出力ヘッド
         self.bev_head = nn.Conv2d(32, 1, 1)
+        # 深度ヘッドの強化
         self.depth_head = nn.Sequential(
-            nn.Conv2d(32, 32, 3, padding=1),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, 3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 1, 1)

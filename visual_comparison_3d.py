@@ -400,7 +400,7 @@ def visualize_gt_vs_prediction(patient_id, model_path, config_path, data_dir, li
 
 if __name__ == '__main__':
     patient_id = 'LIDC-IDRI-0005'
-    model_path = 'experiments_lung/250820_1456_lungBEV_lr5e-06/best_model.pth'
+    model_path = 'experiments_lung/250820_1518_lungBEV_lr5e-06/best_model.pth'
     config_path = 'config_lung.yaml'
     data_dir = 'dataset_lung'
     lidc_root = 'data/manifest-1752629384107/LIDC-IDRI/'  # 調整してください
