@@ -13,7 +13,7 @@ num_workers: 2
 vit_model_name: 'google/vit-base-patch16-224-in21k'
 
 # --- Training Settings ---
-num_epochs: 50
+num_epochs: 200
 learning_rate: 0.000005     # 5e-6（肺野は密なので少し下げる）
 head_learning_rate: 0.001   # ヘッド側LR
 seed: 42

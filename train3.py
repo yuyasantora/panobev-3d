@@ -118,10 +118,11 @@ class PanoBEVDataset3(Dataset):
 # Model (same as train2)
 # ===================================================================
 class ViTPanoBEV3(nn.Module):
-    def __init__(self, vit_model_name):
+    def __init__(self, vit_model_name, output_size=224):
         super().__init__()
         self.vit = ViTModel.from_pretrained(vit_model_name, output_hidden_states=True)
         self.hidden_size = self.vit.config.hidden_size
+        self.output_size = output_size  # 追加
 
         class DecoderBlock(nn.Module):
             def __init__(self, in_channels, skip_channels, out_channels):
@@ -173,11 +174,12 @@ class ViTPanoBEV3(nn.Module):
         bev = self.bev_head(x)
         depth = self.depth_head(x)
 
-        bev  = F.interpolate(bev,  size=(224,224), mode='bilinear', align_corners=False)
-        depth= F.interpolate(depth,size=(224,224), mode='bilinear', align_corners=False)
+        # config で指定されたサイズに合わせる
+        bev  = F.interpolate(bev,  size=(self.output_size, self.output_size), mode='bilinear', align_corners=False)
+        depth= F.interpolate(depth, size=(self.output_size, self.output_size), mode='bilinear', align_corners=False)
 
-        bev = torch.sigmoid(bev)     # regression target in [0,1]
-        depth = torch.sigmoid(depth) # [0,1]
+        bev = torch.sigmoid(bev)
+        depth = torch.sigmoid(depth)
         return bev, depth
 
 # ===================================================================
@@ -188,7 +190,7 @@ def grad_loss(pred, tgt):
     dx_p = pred[..., :, 1:] - pred[..., :, :-1]
     dy_p = pred[..., 1:, :] - pred[..., :-1, :]
     dx_t = tgt[..., :, 1:] - tgt[..., :, :-1]
-    dy_t = tgt[..., 1:, :] - tgt[..., :-1, :]
+    dy_t = tgt[..., 1:, :] - pred[..., :-1, :]
 
     dx = torch.abs(dx_p - dx_t).mean()
     dy = torch.abs(dy_p - dy_t).mean()
@@ -210,6 +212,56 @@ def thresh_dice(pred, tgt_bin, th=0.3, eps=1e-6):
     inter = (pm * tm).sum()
     union = pm.sum() + tm.sum()
     return ((2*inter + eps) / (union + eps)).item()
+
+def physics_consistency_loss(bev_pred, depth_pred, eps=1e-6):
+    """物理的妥当性を強制する損失（安全版）"""
+    try:
+        # 1. 体積整合性（より安全に）
+        bev_mask = (bev_pred > 0.3).float()
+        bev_area = bev_mask.sum(dim=(2,3)) + eps  # ゼロ除算回避
+        
+        # depth_predの値も制限
+        depth_clamped = torch.clamp(depth_pred, 0.0, 1.0)
+        depth_avg = (depth_clamped * bev_mask).sum(dim=(2,3)) / bev_area
+        
+        estimated_volume = bev_area * depth_avg
+        target_volume = torch.tensor(0.5, device=bev_pred.device)
+        
+        # NaN/Inf チェック
+        if torch.isnan(estimated_volume).any() or torch.isinf(estimated_volume).any():
+            return torch.tensor(0.0, device=bev_pred.device)
+        
+        volume_loss = F.mse_loss(estimated_volume.mean(), target_volume)
+        
+        # 2. 形状整合性（より単純に）
+        high_bev_mask = (bev_pred > 0.5).float()
+        if high_bev_mask.sum() > 0:
+            depth_consistency = F.mse_loss(depth_clamped * high_bev_mask, 
+                                          high_bev_mask * 0.5)
+        else:
+            depth_consistency = torch.tensor(0.0, device=bev_pred.device)
+        
+        # 重みを小さく
+        total_physics_loss = 0.01 * volume_loss + 0.01 * depth_consistency
+        
+        # 最終的なNaNチェック
+        if torch.isnan(total_physics_loss) or torch.isinf(total_physics_loss):
+            return torch.tensor(0.0, device=bev_pred.device)
+        
+        return total_physics_loss
+        
+    except Exception as e:
+        print(f"Physics loss error: {e}")
+        return torch.tensor(0.0, device=bev_pred.device)
+
+def get_adaptive_depth_weight(epoch):
+    """エポックに応じて深度損失重みを調整（より保守的に）"""
+    if epoch < 30:    # 30エポックまでBEV専念
+        return 0.0
+    elif epoch < 80:  # 段階的導入をゆっくり
+        return 0.1
+    else:
+        return 0.2    # 最大でも0.2に抑制
 
 # ===================================================================
 # Main
@@ -263,7 +315,10 @@ def main(config_path, resume_from=None):
                           shuffle=False, num_workers=config['num_workers'], pin_memory=True)
 
     # Model
-    model = ViTPanoBEV3(vit_model_name=config['vit_model_name']).to(device)
+    model = ViTPanoBEV3(
+        vit_model_name=config['vit_model_name'],
+        output_size=config['resize_shape'][0]  # 384を渡す
+    ).to(device)
     if resume_from:
         model_path = os.path.join(resume_from, "best_model.pth")
         if os.path.exists(model_path):
@@ -274,7 +329,6 @@ def main(config_path, resume_from=None):
     criterion_bev_reg = nn.MSELoss()
     criterion_depth   = nn.MSELoss()
     bev_grad_weight   = float(config.get('bev_grad_weight', 0.3))
-    depth_loss_weight = float(config.get('depth_loss_weight', 0.0))  # まずBEVに集中
     dice_loss_weight  = float(config.get('dice_loss_weight', 0.2))   # 軽めに
 
     # Optimizer (encoder low LR, heads high LR)
@@ -292,12 +346,16 @@ def main(config_path, resume_from=None):
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=8, verbose=True)
 
     # Train
-    patience, bad = 12, 0  # 密ターゲットなので少し長めに
-    best_val = float('inf')  # Val Loss監視に戻す
+    patience, bad = 75, 0  # 密ターゲットなので少し長めに
+    best_val = float('inf')  # 複合指標は大きい方が良いため
     scaler = torch.cuda.amp.GradScaler()
     
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
+        
+        # 動的深度重み計算
+        adaptive_depth_weight = get_adaptive_depth_weight(epoch)
+        
         model.train()
         train_loss = 0.0
         for batch in tqdm(train_loader, desc="Training"):
@@ -306,18 +364,19 @@ def main(config_path, resume_from=None):
             with torch.cuda.amp.autocast():
                 bev_pred, depth_pred = model(images)
                 
-                # Simplified loss for dense targets (no fg/bg weighting)
+                # 損失計算（深度重みを動的調整）
                 loss_bev_reg = criterion_bev_reg(bev_pred, bev_cont)
                 loss_bev_grad = grad_loss(bev_pred, bev_cont)
                 loss_dice_aux = soft_dice_loss(bev_pred, bev_bin)
                 loss_depth = criterion_depth(depth_pred, depth_tgt)
                 
                 total_loss = loss_bev_reg + bev_grad_weight * loss_bev_grad + \
-                           dice_loss_weight * loss_dice_aux + depth_loss_weight * loss_depth
+                           dice_loss_weight * loss_dice_aux + adaptive_depth_weight * loss_depth
+                # + physics_consistency_loss(bev_pred, depth_pred)  # 一旦コメントアウト
 
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # 1.0→0.5に強化
             scaler.step(optimizer)
             scaler.update()
             train_loss += total_loss.item()
@@ -343,7 +402,7 @@ def main(config_path, resume_from=None):
                 val_dice    += l_dice
                 val_depth   += l_dep
                 val_loss    += l_reg + bev_grad_weight * l_grad + \
-                              dice_loss_weight * l_dice + depth_loss_weight * l_dep
+                              dice_loss_weight * l_dice + adaptive_depth_weight * l_dep
 
                 # Multiple threshold Dice
                 dice_sum_01 += thresh_dice(bev_pred, bev_bin, th=0.1)
@@ -365,17 +424,28 @@ def main(config_path, resume_from=None):
         print(f"Train Loss: {avg_train:.4f}, Val Loss: {avg_val:.4f}")
         print(f"Val BEV(reg): {avg_bev_r:.4f}, BEV(grad): {avg_bev_g:.4f}, Dice: {avg_dice:.4f}, Depth: {avg_dep:.4f}")
         print(f"Avg Dice@0.1: {avg_dice_01:.4f}, @0.2: {avg_dice_02:.4f}, @0.3: {avg_dice_03:.4f}")
+        print(f"Adaptive Depth Weight: {adaptive_depth_weight:.3f}")  # 追加
+
+        # 深度統計も追加
+        with torch.no_grad():
+            depth_mean = depth_pred.mean().item()
+            depth_std = depth_pred.std().item()
+            print(f"Depth Stats: mean={depth_mean:.4f}, std={depth_std:.4f}")
 
         scheduler.step(avg_val)
 
-        if avg_val < best_val - 1e-4:
+        # より賢い早期終了（371行目付近を変更）
+        # Val Lossでなく、複合指標で判断
+        composite_metric = avg_dice_03 - 0.05 * avg_val  # Dice重視、Loss軽視
+        print(f"  Bad epochs: {bad}/{patience}, Best val: {best_val:.4f}, Current: {avg_val:.4f}")
+        if avg_val < best_val - 1e-4:  # Val Lossは小さい方が良い
             best_val = avg_val; bad = 0
             torch.save(model.state_dict(), os.path.join(exp_dir, "best_model.pth"))
             print(f"  -> Best model saved with Val Loss: {best_val:.4f}")
         else:
             bad += 1
-            if bad >= patience: 
-                print("Early stop."); break
+            # if bad >= patience: 
+            #     print("Early stop."); break
 
 if __name__ == '__main__':
     if os.name == 'nt':

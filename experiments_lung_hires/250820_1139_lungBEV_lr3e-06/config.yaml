@@ -1,0 +1,28 @@
+# config_lung_hires.yaml
+data_dir: "dataset_lung"
+output_dir: 'experiments_lung_hires'
+
+# --- Dataset Settings ---
+resize_shape: [320, 320]  # 384→320（少し控えめに）
+
+# --- Dataloader Settings ---
+batch_size: 2             # メモリ制約で削減
+num_workers: 2
+
+# --- Model Settings ---
+vit_model_name: 'google/vit-base-patch16-224-in21k'  # 224モデルのまま使用
+
+# --- Training Settings ---
+num_epochs: 100           # 高解像度なので少し長めに
+learning_rate: 0.000003   # 高解像度用に少し下げる
+head_learning_rate: 0.0008
+seed: 42
+
+# --- Loss Settings ---
+bev_grad_weight: 0.3
+dice_loss_weight: 0.2
+# depth_loss_weight は動的調整するため削除
+
+# --- BEV Settings ---
+bev_target_mode: 'binary'
+bev_gaussian_sigma: 2.0
