@@ -31,5 +31,12 @@ color_jitter_contrast: 0.2
 
 # --- BEV Settings ---
 bev_target_mode: 'gaussian'
-bev_gaussian_sigma: 3.0
+bev_gaussian_sigma: 8.0  # 4.0 → 8.0（密な信号）
 bev_grad_weight: 0.5
+
+def soft_dice_loss(pred, tgt_bin, eps=1e-6):
+    p = pred.clamp(0,1)
+    t = (tgt_bin > 0.5).float()
+    inter = (p * t).sum()
+    union = p.sum() + t.sum()
+    return 1.0 - (2*inter + eps) / (union + eps)

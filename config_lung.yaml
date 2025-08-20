@@ -1,0 +1,32 @@
+# config_lung.yaml
+data_dir: "dataset_lung"
+output_dir: 'experiments_lung'  # スペースを削除
+
+# --- Dataset Settings ---
+resize_shape: [224, 224]
+
+# --- Dataloader Settings ---
+batch_size: 4
+num_workers: 2
+
+# --- Model Settings ---
+vit_model_name: 'google/vit-base-patch16-224-in21k'
+
+# --- Training Settings ---
+num_epochs: 50
+learning_rate: 0.000005     # 5e-6（肺野は密なので少し下げる）
+head_learning_rate: 0.001   # ヘッド側LR
+seed: 42
+depth_loss_weight: 0.1    # BEVに全集中
+
+# --- Augmentation Settings ---
+use_augmentation: false
+rotation_degrees: 10
+color_jitter_brightness: 0.2
+color_jitter_contrast: 0.2
+
+# --- BEV Settings (for dense lung targets) ---
+bev_target_mode: 'binary'     # まずbinaryで（密なので十分）
+bev_gaussian_sigma: 2.0       # gaussianの場合用
+bev_grad_weight: 0.3          # 勾配損失の重み
+dice_loss_weight: 0.2         # ソフトDice損失の重み

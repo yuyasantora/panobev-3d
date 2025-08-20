@@ -8,7 +8,7 @@ import drr_generator as drr_gen
 
 # --- 設定項目 ---
 ROOT_DATA_DIR = 'data/manifest-1752629384107/LIDC-IDRI/'
-OUTPUT_DIR = 'dataset'
+OUTPUT_DIR = 'dataset_lung'
 ROTATION_ANGLES_X = [-30, 0, 30]
 # ★ データ分割の比率と乱数シード
 SPLIT_RATIOS = {'train': 0.8, 'val': 0.1, 'test': 0.1}
@@ -38,7 +38,7 @@ def find_scan_and_xml_robust(patient_dir: str):
 
 def process_patient(patient_dir, output_base_dir):
     """
-    一人の患者データを処理し、指定された出力ディレクトリに保存する関数
+    一人の患者データを処理し、指定された出力ディレクトリに保存する関数（肺野版）
     """
     patient_id = os.path.basename(patient_dir)
     image_dir = os.path.join(output_base_dir, 'images')
@@ -46,8 +46,8 @@ def process_patient(patient_dir, output_base_dir):
     depth_dir = os.path.join(output_base_dir, 'depths')
 
     dicom_path, xml_path = find_scan_and_xml_robust(patient_dir)
-    if not dicom_path or not xml_path:
-        print(f"  [!] {patient_id}: CTまたはXMLが見つからずスキップ。")
+    if not dicom_path:
+        print(f"  [!] {patient_id}: CTが見つからずスキップ。")
         return
 
     try:
@@ -56,13 +56,17 @@ def process_patient(patient_dir, output_base_dir):
         reader.SetFileNames(dicom_names)
         original_image = reader.Execute()
         resampled_image = drr_gen.resample_image_to_isotropic(original_image)
-        nodule_mask_3d = drr_gen.create_nodule_mask(xml_path, original_image, resampled_image)
-        bev_target = drr_gen.create_bev_target(nodule_mask_3d)
+        
+        # 肺野マスク作成
+        ct_array = sitk.GetArrayFromImage(resampled_image)
+        lung_mask_3d = extract_lung_mask(ct_array)
+        bev_target = create_lung_bev(lung_mask_3d)
 
-        bev_array = np.squeeze(sitk.GetArrayFromImage(bev_target))
+        # 肺野BEV保存
         target_filename = f"{patient_id}_bev.npy"
-        np.save(os.path.join(target_dir, target_filename), bev_array)
+        np.save(os.path.join(target_dir, target_filename), bev_target)
 
+        # DRRと深度は従来通り
         for angle in ROTATION_ANGLES_X:
             angle_rad = np.deg2rad(angle)
             drr = drr_gen.generate_drr(resampled_image, rotation_x_rad=angle_rad)
@@ -125,6 +129,21 @@ def build_dataset():
             process_patient(patient_dir, output_base_dir)
 
     print("\nデータセットの構築と分割が完了しました！")
+
+# build_dataset.py に追加する関数
+def extract_lung_mask(ct_array, hu_threshold=-500):
+    """CTから肺野領域を抽出"""
+    # HU値で粗い肺野抽出 + モルフォロジー処理
+    lung_mask = (ct_array < hu_threshold) & (ct_array > -1000)
+    # 連結成分分析で大きな領域のみ保持
+    # 穴埋め処理等
+    return lung_mask.astype(np.uint8)
+
+def create_lung_bev(lung_mask_3d):
+    """3D肺野マスク → BEV投影"""
+    # Z軸（上下）方向に最大値投影
+    bev = np.max(lung_mask_3d, axis=0)  # (Y,X) → (X,Z)に転置
+    return bev.T
 
 if __name__ == '__main__':
     build_dataset()

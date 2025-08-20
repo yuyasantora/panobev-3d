@@ -1,6 +1,9 @@
 # Data and cache
 data/
 dataset/
+dataset_lung/
+experiments_lung/
+experiments/
 __pycache__/
 *.pyc
 

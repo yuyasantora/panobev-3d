@@ -1,4 +1,4 @@
-# train2.py
+# train3.py
 import os
 import yaml
 import shutil
@@ -15,7 +15,6 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 import argparse
-from torch.utils.data import WeightedRandomSampler
 
 def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -25,9 +24,9 @@ def set_seed(seed):
         torch.backends.cudnn.benchmark = False
 
 # ===================================================================
-# Dataset (continuous BEV target on-the-fly)
+# Dataset (dense lung BEV targets)
 # ===================================================================
-class PanoBEVDataset2(Dataset):
+class PanoBEVDataset3(Dataset):
     def __init__(self, dataset_dir: str, resize_shape: tuple, augmentation_config: dict, bev_cfg: dict):
         self.image_dir = os.path.join(dataset_dir, 'images')
         self.target_dir = os.path.join(dataset_dir, 'targets')
@@ -35,9 +34,8 @@ class PanoBEVDataset2(Dataset):
         self.resize_shape = resize_shape
         self.use_augmentation = augmentation_config.get('use_augmentation', False)
 
-        self.bev_mode = bev_cfg.get('bev_target_mode', 'gaussian')  # 'gaussian' | 'distance' | 'binary'
-        self.bev_gauss_sigma = float(bev_cfg.get('bev_gaussian_sigma', 1.5))
-        self.bev_distance_tau = float(bev_cfg.get('bev_distance_tau', 3.0))
+        self.bev_mode = bev_cfg.get('bev_target_mode', 'binary')  # 肺野は密なのでbinaryでもOK
+        self.bev_gauss_sigma = float(bev_cfg.get('bev_gaussian_sigma', 2.0))
         self.normalize_input = bool(bev_cfg.get('normalize_input', True))
 
         self.image_files = sorted([f for f in os.listdir(self.image_dir) if f.endswith('.npy')])
@@ -56,7 +54,7 @@ class PanoBEVDataset2(Dataset):
         depth_path = os.path.join(self.depth_dir, depth_filename)
 
         image = np.load(image_path)
-        bev_target_np = np.load(bev_path)      # 2D
+        bev_target_np = np.load(bev_path)      # 2D lung BEV
         depth_target = np.load(depth_path)     # 2D
 
         # to SITK
@@ -78,26 +76,20 @@ class PanoBEVDataset2(Dataset):
         resized_bev_bin = sitk.GetArrayFromImage(resize_image(bev_sitk, sitk.sitkNearestNeighbor))
         resized_depth = sitk.GetArrayFromImage(resize_image(depth_sitk, sitk.sitkLinear))
 
-        # Binary BEV (for logging Dice, etc)
+        # Binary BEV (lung mask)
         bev_binary = (resized_bev_bin > 0).astype(np.float32)
 
-        # Continuous BEV target
+        # Continuous BEV target (for dense targets, simpler processing)
         if self.bev_mode == 'binary':
             bev_cont = bev_binary
         elif self.bev_mode == 'gaussian':
-            # Gaussian blur on binary mask
+            # Light gaussian for smoothing
             bev_img = sitk.GetImageFromArray(bev_binary.astype(np.float32))
             gauss = sitk.DiscreteGaussian(bev_img, variance=float(self.bev_gauss_sigma**2))
             bev_cont = sitk.GetArrayFromImage(gauss).astype(np.float32)
             m = bev_cont.max()
             if m > 1e-6:
                 bev_cont = bev_cont / m
-        elif self.bev_mode == 'distance':
-            # Signed distance -> soft heatmap exp(-|d|/tau)
-            bin_img = sitk.GetImageFromArray(bev_binary.astype(np.uint8))
-            dist = sitk.SignedMaurerDistanceMap(bin_img, insideIsPositive=True, squaredDistance=False, useImageSpacing=False)
-            d = np.abs(sitk.GetArrayFromImage(dist)).astype(np.float32)
-            bev_cont = np.exp(-(d / float(self.bev_distance_tau)))
         else:
             bev_cont = bev_binary  # fallback
 
@@ -123,9 +115,9 @@ class PanoBEVDataset2(Dataset):
         return image_tensor, bev_cont_tensor, depth_tensor, bev_bin_tensor
 
 # ===================================================================
-# Model (apply sigmoid to both heads for [0,1] range)
+# Model (same as train2)
 # ===================================================================
-class ViTPanoBEV2(nn.Module):
+class ViTPanoBEV3(nn.Module):
     def __init__(self, vit_model_name):
         super().__init__()
         self.vit = ViTModel.from_pretrained(vit_model_name, output_hidden_states=True)
@@ -189,7 +181,7 @@ class ViTPanoBEV2(nn.Module):
         return bev, depth
 
 # ===================================================================
-# Loss/metrics
+# Loss/metrics (optimized for dense targets)
 # ===================================================================
 def grad_loss(pred, tgt):
     # pred,tgt: [B,1,H,W], in [0,1]
@@ -198,10 +190,9 @@ def grad_loss(pred, tgt):
     dx_t = tgt[..., :, 1:] - tgt[..., :, :-1]
     dy_t = tgt[..., 1:, :] - tgt[..., :-1, :]
 
-    # pad back to [B,1,H,W]
-    dx = F.pad(torch.abs(dx_p - dx_t), (0,1,0,0), mode='replicate')
-    dy = F.pad(torch.abs(dy_p - dy_t), (0,0,0,1), mode='replicate')
-    return (dx.mean() + dy.mean()) * 0.5
+    dx = torch.abs(dx_p - dx_t).mean()
+    dy = torch.abs(dy_p - dy_t).mean()
+    return (dx + dy) * 0.5
 
 def soft_dice_loss(pred, tgt_bin, eps=1e-6):
     p = pred.clamp(0,1)
@@ -236,7 +227,7 @@ def main(config_path, resume_from=None):
         exp_name = os.path.basename(exp_dir)
         print(f"--- Resuming Experiment: {exp_name} ---")
     else:
-        exp_name = f"{datetime.now().strftime('%y%m%d_%H%M')}_contBEV_lr{config['learning_rate']}"
+        exp_name = f"{datetime.now().strftime('%y%m%d_%H%M')}_lungBEV_lr{config['learning_rate']}"
         exp_dir = os.path.join(config['output_dir'], exp_name)
         os.makedirs(exp_dir, exist_ok=True)
         shutil.copy(config_path, os.path.join(exp_dir, 'config.yaml'))
@@ -248,49 +239,43 @@ def main(config_path, resume_from=None):
 
     # Data
     bev_cfg = {
-        'bev_target_mode': config.get('bev_target_mode', 'gaussian'),
-        'bev_gaussian_sigma': config.get('bev_gaussian_sigma', 1.5),
-        'bev_distance_tau': config.get('bev_distance_tau', 3.0),
+        'bev_target_mode': config.get('bev_target_mode', 'binary'),
+        'bev_gaussian_sigma': config.get('bev_gaussian_sigma', 2.0),
         'normalize_input': True
     }
-    train_dataset = PanoBEVDataset2(
+    train_dataset = PanoBEVDataset3(
         dataset_dir=os.path.join(config['data_dir'], 'train'),
         resize_shape=config['resize_shape'],
         augmentation_config=config,
         bev_cfg=bev_cfg
     )
-    val_dataset = PanoBEVDataset2(
+    val_dataset = PanoBEVDataset3(
         dataset_dir=os.path.join(config['data_dir'], 'val'),
         resize_shape=config['resize_shape'],
         augmentation_config={'use_augmentation': False},
         bev_cfg=bev_cfg
     )
-    train_target_dir = os.path.join(config['data_dir'], 'train', 'targets')
-    weights = []
-    for f in train_dataset.image_files:
-        pid = f.replace('.npy','').split('_')[0]
-        bev = np.load(os.path.join(train_target_dir, f"{pid}_bev.npy"))
-        weights.append(10.0 if (bev > 0).any() else 1.0)
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
+    
+    # No weighted sampling needed for dense targets
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'],
-                          sampler=sampler, shuffle=False, num_workers=config['num_workers'], pin_memory=True)
+                          shuffle=True, num_workers=config['num_workers'], pin_memory=True)
     val_loader   = DataLoader(val_dataset,   batch_size=config['batch_size'],
                           shuffle=False, num_workers=config['num_workers'], pin_memory=True)
 
     # Model
-    model = ViTPanoBEV2(vit_model_name=config['vit_model_name']).to(device)
+    model = ViTPanoBEV3(vit_model_name=config['vit_model_name']).to(device)
     if resume_from:
         model_path = os.path.join(resume_from, "best_model.pth")
         if os.path.exists(model_path):
             model.load_state_dict(torch.load(model_path, map_location=device))
             print(f"Resumed model weights from: {model_path}")
 
-    # Loss
+    # Loss (simplified for dense targets)
     criterion_bev_reg = nn.MSELoss()
     criterion_depth   = nn.MSELoss()
-    bev_grad_weight   = float(config.get('bev_grad_weight', 0.5))
+    bev_grad_weight   = float(config.get('bev_grad_weight', 0.3))
     depth_loss_weight = float(config.get('depth_loss_weight', 0.0))  # まずBEVに集中
+    dice_loss_weight  = float(config.get('dice_loss_weight', 0.2))   # 軽めに
 
     # Optimizer (encoder low LR, heads high LR)
     head_params = list(model.bottleneck.parameters()) + \
@@ -304,12 +289,13 @@ def main(config_path, resume_from=None):
         {'params': model.vit.parameters(), 'lr': config['learning_rate']},
         {'params': head_params, 'lr': float(config.get('head_learning_rate', 1e-3))},
     ])
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=8, verbose=True)
 
     # Train
-    patience, bad = 8, 0
-    best_val = 0.0  # float('inf') → 0.0 に（DiceNZは大きい方が良いため）
+    patience, bad = 12, 0  # 密ターゲットなので少し長めに
+    best_val = float('inf')  # Val Loss監視に戻す
     scaler = torch.cuda.amp.GradScaler()
+    
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
         model.train()
@@ -319,24 +305,18 @@ def main(config_path, resume_from=None):
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
                 bev_pred, depth_pred = model(images)
-                fg = (bev_bin > 0.5).float()
-                alpha = 0.98  # 前景寄与を強く
-
-                # スカラーへ縮約（バッチ全体で総和→画素数で正規化）
-                diff2 = (bev_pred - bev_cont).pow(2)
-                pos_count = fg.sum()
-                neg_count = (1 - fg).sum()
-                mse_pos = (diff2 * fg).sum() / (pos_count + 1e-6)
-                mse_neg = (diff2 * (1 - fg)).sum() / (neg_count + 1e-6)
-                loss_bev_reg = alpha * mse_pos + (1 - alpha) * mse_neg
-
+                
+                # Simplified loss for dense targets (no fg/bg weighting)
+                loss_bev_reg = criterion_bev_reg(bev_pred, bev_cont)
                 loss_bev_grad = grad_loss(bev_pred, bev_cont)
                 loss_dice_aux = soft_dice_loss(bev_pred, bev_bin)
                 loss_depth = criterion_depth(depth_pred, depth_tgt)
-                total_loss = loss_bev_reg + bev_grad_weight * loss_bev_grad + 1.0 * loss_dice_aux + depth_loss_weight * loss_depth
+                
+                total_loss = loss_bev_reg + bev_grad_weight * loss_bev_grad + \
+                           dice_loss_weight * loss_dice_aux + depth_loss_weight * loss_depth
 
             scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)  # クリップはunscale後に
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
@@ -344,8 +324,10 @@ def main(config_path, resume_from=None):
 
         # Val
         model.eval()
-        val_loss = val_bev_reg = val_bev_grad = val_depth = 0.0
-        dice_nz_sum = 0.0; nz_batches = 0
+        val_loss = val_bev_reg = val_bev_grad = val_depth = val_dice = 0.0
+        dice_sum_01 = dice_sum_02 = dice_sum_03 = 0.0
+        val_count = 0
+        
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation"):
                 images, bev_cont, depth_tgt, bev_bin = [b.to(device) for b in batch]
@@ -353,42 +335,43 @@ def main(config_path, resume_from=None):
 
                 l_reg = criterion_bev_reg(bev_pred, bev_cont).item()
                 l_grad= grad_loss(bev_pred, bev_cont).item()
-                l_bev = l_reg + bev_grad_weight * l_grad
+                l_dice= soft_dice_loss(bev_pred, bev_bin).item()
                 l_dep = criterion_depth(depth_pred, depth_tgt).item()
 
                 val_bev_reg += l_reg
                 val_bev_grad+= l_grad
+                val_dice    += l_dice
                 val_depth   += l_dep
-                val_loss    += l_bev + depth_loss_weight * l_dep
+                val_loss    += l_reg + bev_grad_weight * l_grad + \
+                              dice_loss_weight * l_dice + depth_loss_weight * l_dep
 
-                # Dice vs binary mask (参考)
-                nz = (bev_bin.sum(dim=(2,3)) > 0)
-                if nz.any():
-                    d = thresh_dice(bev_pred[nz], bev_bin[nz], th=0.3)
-                    dice_nz_sum += d
-                    nz_batches += 1
-
-                p = bev_pred
-                print(f"val p.mean={p.mean().item():.6f}, p.max={p.max().item():.6f}")
+                # Multiple threshold Dice
+                dice_sum_01 += thresh_dice(bev_pred, bev_bin, th=0.1)
+                dice_sum_02 += thresh_dice(bev_pred, bev_bin, th=0.2)
+                dice_sum_03 += thresh_dice(bev_pred, bev_bin, th=0.3)
+                val_count += 1
 
         avg_train = train_loss / max(1, len(train_loader))
         avg_val   = val_loss   / max(1, len(val_loader))
         avg_bev_r = val_bev_reg/ max(1, len(val_loader))
         avg_bev_g = val_bev_grad/max(1, len(val_loader))
+        avg_dice  = val_dice   / max(1, len(val_loader))
         avg_dep   = val_depth  / max(1, len(val_loader))
-        avg_dice_nz = (dice_nz_sum / nz_batches) if nz_batches>0 else 0.0
+        
+        avg_dice_01 = dice_sum_01 / max(1, val_count)
+        avg_dice_02 = dice_sum_02 / max(1, val_count)
+        avg_dice_03 = dice_sum_03 / max(1, val_count)
 
-        print(f"Train Loss: {avg_train:.4f}, Val Loss: {avg_val:.4f}, "
-              f"Val BEV(reg): {avg_bev_r:.4f}, Val BEV(grad): {avg_bev_g:.4f}, "
-              f"Val Depth: {avg_dep:.4f}, Avg DiceNZ@0.3: {avg_dice_nz:.4f} (nz_batches={nz_batches})")
+        print(f"Train Loss: {avg_train:.4f}, Val Loss: {avg_val:.4f}")
+        print(f"Val BEV(reg): {avg_bev_r:.4f}, BEV(grad): {avg_bev_g:.4f}, Dice: {avg_dice:.4f}, Depth: {avg_dep:.4f}")
+        print(f"Avg Dice@0.1: {avg_dice_01:.4f}, @0.2: {avg_dice_02:.4f}, @0.3: {avg_dice_03:.4f}")
 
-        # depth_loss_weightが0でない運用も想定し、BEVのみでLRを下げる
-        scheduler.step(avg_bev_r + bev_grad_weight * avg_bev_g)
+        scheduler.step(avg_val)
 
-        if avg_dice_nz > best_val + 1e-3:  # DiceNZが0.001以上改善したら
-            best_val = avg_dice_nz; bad = 0
+        if avg_val < best_val - 1e-4:
+            best_val = avg_val; bad = 0
             torch.save(model.state_dict(), os.path.join(exp_dir, "best_model.pth"))
-            print(f"  -> Best model saved with DiceNZ: {best_val:.4f}")
+            print(f"  -> Best model saved with Val Loss: {best_val:.4f}")
         else:
             bad += 1
             if bad >= patience: 
@@ -397,8 +380,8 @@ def main(config_path, resume_from=None):
 if __name__ == '__main__':
     if os.name == 'nt':
         torch.multiprocessing.freeze_support()
-    parser = argparse.ArgumentParser(description="PanoBEV-3D Training Script (continuous BEV)")
-    parser.add_argument('--config', type=str, default='config.yaml', help="設定ファイルのパス")
+    parser = argparse.ArgumentParser(description="PanoBEV-3D Training Script (Lung BEV)")
+    parser.add_argument('--config', type=str, default='config_lung.yaml', help="設定ファイルのパス")
     parser.add_argument('--resume_from', type=str, default=None, help="再開する実験ディレクトリパス")
     args = parser.parse_args()
     main(args.config, args.resume_from)
