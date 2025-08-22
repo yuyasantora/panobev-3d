@@ -1,4 +1,4 @@
-# train3.py
+# train4.py - ViT+VGGTハイブリッドモデル版
 import os
 import yaml
 import shutil
@@ -12,10 +12,11 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import ViTModel
 import SimpleITK as sitk
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR  # 変更
 from tqdm import tqdm
 import argparse
 
+# ... set_seed関数とDatasetクラスは train3.py と同じ ...
 def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -39,11 +40,16 @@ class PanoBEVDataset3(Dataset):
         self.normalize_input = bool(bev_cfg.get('normalize_input', True))
 
         self.image_files = sorted([f for f in os.listdir(self.image_dir) if f.endswith('.npy')])
+        self._cache = {}
+        self.max_cache_size = 100  # 適切なサイズに調整
 
     def __len__(self):
         return len(self.image_files)
 
     def __getitem__(self, idx):
+        if idx in self._cache:
+            return self._cache[idx]
+            
         image_filename = self.image_files[idx]
         image_path = os.path.join(self.image_dir, image_filename)
         base_filename = image_filename.replace('.npy', '')
@@ -112,37 +118,102 @@ class PanoBEVDataset3(Dataset):
         bev_bin_tensor  = torch.from_numpy(bev_binary).float().unsqueeze(0)
         depth_tensor = torch.from_numpy(resized_depth).float().unsqueeze(0)
 
-        return image_tensor, bev_cont_tensor, depth_tensor, bev_bin_tensor
+        result = image_tensor, bev_cont_tensor, depth_tensor, bev_bin_tensor
+        if len(self._cache) < self.max_cache_size:
+            self._cache[idx] = result
+            
+        return result
+
 
 # ===================================================================
-# Model (same as train2)
+# VGGT Backbone
 # ===================================================================
-class ViTPanoBEV3_MultiScale(nn.Module):
+class VGGTBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)  # プーリングを分離
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.token_mixer = nn.Conv2d(out_channels, out_channels, 1)
+        self.channel_mixer = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels * 2, 1),
+            nn.GELU(),
+            nn.Conv2d(out_channels * 2, out_channels, 1)
+        )
+        
+    def forward(self, x):
+        # 空間特徴抽出
+        x = F.gelu(self.bn1(self.conv1(x)))
+        x = F.gelu(self.bn2(self.conv2(x)))
+        
+        # トークンミキシング
+        identity = x
+        x = self.token_mixer(x)
+        x = x + identity
+        
+        # チャネルミキシング
+        identity = x
+        x = self.channel_mixer(x)
+        x = x + identity
+        
+        # プーリング
+        x = self.pool(x)
+        
+        return x
+
+# 1. VGGTバックボーンの構造を明確に
+def create_vggt_backbone():
+    return nn.ModuleList([
+        VGGTBlock(3, 64),      # 224 -> 112, channels: 3 -> 64
+        VGGTBlock(64, 128),    # 112 -> 56,  channels: 64 -> 128
+        VGGTBlock(128, 256),   # 56 -> 28,   channels: 128 -> 256
+        VGGTBlock(256, 512)    # 28 -> 14,   channels: 256 -> 512
+    ])
+
+# ===================================================================
+# Hybrid Model (ViT + VGGT)
+# ===================================================================
+class HybridViTPanoBEV(nn.Module):
     def __init__(self, vit_model_name, output_size=224):
         super().__init__()
+        # ViTパス
         self.vit = ViTModel.from_pretrained(vit_model_name, output_hidden_states=True)
-        self.hidden_size = self.vit.config.hidden_size
-        self.output_size = output_size
-
-        # 各スケールの特徴変換
-        self.scale_convs = nn.ModuleList([
-            nn.Conv2d(self.hidden_size, 256, 1),  # 細部 (layer 4)
-            nn.Conv2d(self.hidden_size, 256, 1),  # 中間 (layer 8)
-            nn.Conv2d(self.hidden_size, 256, 1)   # 大域 (layer 12)
+        self.vit_hidden_size = self.vit.config.hidden_size
+        
+        # VGGTパス
+        self.vggt = create_vggt_backbone()
+        self.vggt_pools = nn.ModuleList([
+            nn.MaxPool2d(2) for _ in range(4)
         ])
-
+        
+        # 特徴変換（ViT）
+        self.vit_convs = nn.ModuleList([
+            nn.Conv2d(self.vit_hidden_size, 256, 1),  # 細部
+            nn.Conv2d(self.vit_hidden_size, 256, 1),  # 中間
+            nn.Conv2d(self.vit_hidden_size, 256, 1)   # 大域
+        ])
+        
+        # 特徴変換（VGGT）- チャネル数を修正
+        self.vggt_convs = nn.ModuleList([
+            nn.Conv2d(64, 256, 1),    # 第1層 (112x112, 64ch -> 256ch)
+            nn.Conv2d(128, 256, 1),   # 第2層 (56x56, 128ch -> 256ch)
+            nn.Conv2d(256, 256, 1)    # 第3層 (28x28, 256ch -> 256ch)
+        ])
+        
         # 強化された特徴融合
         self.fusion = nn.Sequential(
-            nn.Conv2d(256*3, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(256*6, 512, 3, padding=1),  # ViT(3) + VGGT(3) = 6
+            nn.BatchNorm2d(512),
             nn.ReLU(),
-            nn.Conv2d(256, 256, 3, padding=1),
+            nn.Conv2d(512, 256, 3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
             nn.Conv2d(256, 128, 1)
         )
-
-        # デコーダー
+        
+        # デコーダー（train3.pyと同じ）
         self.decoder = nn.Sequential(
             nn.Conv2d(128, 64, 3, padding=1),
             nn.BatchNorm2d(64),
@@ -151,73 +222,143 @@ class ViTPanoBEV3_MultiScale(nn.Module):
             nn.BatchNorm2d(32),
             nn.ReLU()
         )
-
-        # 改良された出力ヘッド
+        
+        # 出力ヘッド
         self.bev_head = nn.Conv2d(32, 1, 1)
-        # 深度ヘッドの強化
+        # 深度ヘッドを修正
         self.depth_head = nn.Sequential(
-            nn.Conv2d(32, 64, 3, padding=1),
+            nn.Conv2d(32, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.Conv2d(128, 128, 3, dilation=2, padding=2),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.Conv2d(128, 64, 3, dilation=4, padding=4),
             nn.BatchNorm2d(64),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Conv2d(64, 32, 3, padding=1),
             nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, 1, 1)
+            nn.GELU()
         )
 
+        # 出力層を分離
+        self.depth_output = nn.Sequential(
+            nn.Conv2d(32, 1, 1),
+            nn.Softplus()
+        )
+
+        # 形状一貫性モジュールのチャネル数を修正
+        self.shape_consistency = nn.Sequential(
+            nn.Conv2d(33, 64, 3, padding=1),  # 32 + 1 = 33チャネル
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 1, 1)
+        )
+        
+        self.output_size = output_size
+        
     def forward(self, x):
-        # 入力処理
+        B = x.shape[0]
+        
+        # ViTパス
         if x.shape[1] == 1:
-            x = x.repeat(1, 3, 1, 1)
-
-        # ViT特徴抽出
-        outputs = self.vit(x)
-        hidden_states = outputs.hidden_states
-
-        # 各スケールの特徴を抽出・処理
-        features = []
+            x_vit = x.repeat(1, 3, 1, 1)
+        else:
+            x_vit = x
+            
+        vit_outputs = self.vit(x_vit)
+        vit_features = []
+        
+        # ViT特徴の抽出（3スケール）
         for i, layer_idx in enumerate([4, 8, 12]):
-            # hidden_statesから特徴マップを復元
-            h = hidden_states[layer_idx]
-            B = h.shape[0]
-            h = h[:, 1:].transpose(1, 2).reshape(B, self.hidden_size, 14, 14)
+            h = vit_outputs.hidden_states[layer_idx]
+            h = h[:, 1:].transpose(1, 2).reshape(B, self.vit_hidden_size, 14, 14)
+            h = self.vit_convs[i](h)
+            if i > 0:
+                h = F.interpolate(h, size=(14, 14), mode='bilinear', align_corners=False)
+            vit_features.append(h)
             
-            # スケール特徴の変換
-            h = self.scale_convs[i](h)
+        # VGGTパス
+        vggt_features = []
+        x_vggt = x_vit  # 入力共有
+        
+        # 特徴抽出（最初の3層のみ使用）
+        for i, block in enumerate(self.vggt):
+            if i >= 3:  # 最後の層は使用しない
+                break
+            x_vggt = block(x_vggt)
+            vggt_features.append(x_vggt)
             
-            # サイズ調整
-            if i > 0:  # 中間・大域特徴を細部特徴のサイズに合わせる
+        # 特徴変換（3スケール）- サイズを明示的に制御
+        vggt_processed = []
+        for i, feat in enumerate(vggt_features):
+            # 現在のサイズを取得
+            _, _, H, W = feat.shape
+            
+            # 特徴変換
+            h = self.vggt_convs[i](feat)
+            
+            # 全ての特徴を14x14にリサイズ
+            if H != 14 or W != 14:
                 h = F.interpolate(h, size=(14, 14), mode='bilinear', align_corners=False)
             
-            features.append(h)
-
-        # 特徴融合
-        fused = self.fusion(torch.cat(features, dim=1))
+            vggt_processed.append(h)
+            
+        
+        # 特徴融合（ViT + VGGT）
+        fused = self.fusion(torch.cat(vit_features + vggt_processed, dim=1))
         
         # デコード
         decoded = self.decoder(fused)
-
-        # 最終出力
+        
+        # BEVとDepthの処理を修正
         bev = self.bev_head(decoded)
-        depth = self.depth_head(decoded)
-
-        # サイズ調整とシグモイド
-        bev = F.interpolate(bev, size=(self.output_size, self.output_size), 
+        depth_features = self.depth_head(decoded)
+        
+        # 特徴の結合を修正
+        combined = torch.cat([depth_features, bev], dim=1)  # [B, 33, H, W]
+        shape_guidance = self.shape_consistency(combined)
+        
+        # 最終的な深度出力
+        depth = self.depth_output(depth_features + shape_guidance)
+        
+        # サイズ調整
+        bev = F.interpolate(bev, size=(self.output_size, self.output_size),
                           mode='bilinear', align_corners=False)
-        depth = F.interpolate(depth, size=(self.output_size, self.output_size), 
+        depth = F.interpolate(depth, size=(self.output_size, self.output_size),
                             mode='bilinear', align_corners=False)
+        
+        return torch.sigmoid(bev), depth  # depthはすでにSoftplusを通過
 
-        return torch.sigmoid(bev), torch.sigmoid(depth)
+# 新しい損失関数
+def depth_shape_loss(bev_pred, depth_pred, bev_target, depth_target):
+    """3D形状を考慮した深度損失"""
+    # 基本的なMSE損失
+    mse_loss = F.mse_loss(depth_pred, depth_target)
+    
+    # 勾配の連続性
+    depth_dx = depth_pred[:, :, :, 1:] - depth_pred[:, :, :, :-1]
+    depth_dy = depth_pred[:, :, 1:, :] - depth_pred[:, :, :-1, :]
+    target_dx = depth_target[:, :, :, 1:] - depth_target[:, :, :, :-1]
+    target_dy = depth_target[:, :, 1:, :] - depth_target[:, :, :-1, :]
+    
+    gradient_loss = F.l1_loss(depth_dx, target_dx) + F.l1_loss(depth_dy, target_dy)
+    
+    # BEVマスク領域での深度の一貫性
+    bev_mask = (bev_pred > 0.5).float()
+    consistency_loss = F.l1_loss(depth_pred * bev_mask, depth_target * bev_mask)
+    
+    return mse_loss + 0.1 * gradient_loss + 0.5 * consistency_loss
 
-# ===================================================================
-# Loss/metrics (optimized for dense targets)
-# ===================================================================
+# ... Loss関数は train3.py と同じ（ただしgrad_lossのバグ修正） ...
 def grad_loss(pred, tgt):
-    # pred,tgt: [B,1,H,W], in [0,1]
     dx_p = pred[..., :, 1:] - pred[..., :, :-1]
     dy_p = pred[..., 1:, :] - pred[..., :-1, :]
     dx_t = tgt[..., :, 1:] - tgt[..., :, :-1]
-    dy_t = tgt[..., 1:, :] - pred[..., :-1, :]
+    dy_t = tgt[..., 1:, :] - tgt[..., :-1, :]  # 修正
 
     dx = torch.abs(dx_p - dx_t).mean()
     dy = torch.abs(dy_p - dy_t).mean()
@@ -281,6 +422,22 @@ def physics_consistency_loss(bev_pred, depth_pred, eps=1e-6):
         print(f"Physics loss error: {e}")
         return torch.tensor(0.0, device=bev_pred.device)
 
+def depth_consistency_loss(depth_pred, depth_tgt, bev_mask):
+    """深度の連続性を保証する損失"""
+    # 勾配の連続性
+    dx = depth_pred[:, :, :, 1:] - depth_pred[:, :, :, :-1]
+    dy = depth_pred[:, :, 1:, :] - depth_pred[:, :, :-1, :]
+    
+    grad_loss = torch.mean(torch.abs(dx)) + torch.mean(torch.abs(dy))
+    
+    # マスク領域での深度損失
+    masked_loss = F.mse_loss(depth_pred * bev_mask, depth_tgt * bev_mask)
+    
+    # 深度の単調性を促進
+    monotonicity_loss = torch.relu(-dx).mean() + torch.relu(-dy).mean()
+    
+    return masked_loss + 0.1 * grad_loss + 0.05 * monotonicity_loss
+
 def get_adaptive_depth_weight(epoch):
     if epoch < 50:
         return 0.05   # 軽めから開始
@@ -289,10 +446,23 @@ def get_adaptive_depth_weight(epoch):
     else:
         return 0.15   # 最終的に適度な重み
 
-# ===================================================================
-# Main
-# ===================================================================
+# Warmup付き
+def get_warmup_factor(epoch, warmup_epochs=5):
+    if epoch < warmup_epochs:
+        return epoch / warmup_epochs
+    return 1.0
+
+def init_weights(m):
+    if isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.ones_(m.weight)
+        nn.init.zeros_(m.bias)
+
 def main(config_path, resume_from=None):
+    # ... 設定読み込みなど（train3.pyと同じ） ...
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     set_seed(config.get('seed', 42))
@@ -340,40 +510,49 @@ def main(config_path, resume_from=None):
     val_loader   = DataLoader(val_dataset,   batch_size=config['batch_size'],
                           shuffle=False, num_workers=config['num_workers'], pin_memory=True)
 
-    # Model
-    model = ViTPanoBEV3_MultiScale(
+    
+    # モデル
+    model = HybridViTPanoBEV(
         vit_model_name=config['vit_model_name'],
-        output_size=config['resize_shape'][0]  # 384を渡す
+        output_size=config['resize_shape'][0]
     ).to(device)
     if resume_from:
         model_path = os.path.join(resume_from, "best_model.pth")
         if os.path.exists(model_path):
             model.load_state_dict(torch.load(model_path, map_location=device))
             print(f"Resumed model weights from: {model_path}")
-
-    # Loss (simplified for dense targets)
+    
     criterion_bev_reg = nn.MSELoss()
     criterion_depth   = nn.MSELoss()
     bev_grad_weight   = float(config.get('bev_grad_weight', 0.3))
     dice_loss_weight  = float(config.get('dice_loss_weight', 0.2))   # 軽めに
-
-    # Optimizer (encoder low LR, heads high LR)
-    head_params = list(model.scale_convs.parameters()) + \
-                  list(model.fusion.parameters()) + \
-                  list(model.decoder.parameters()) + \
-                  list(model.bev_head.parameters()) + \
-                  list(model.depth_head.parameters())
+    
+    # オプティマイザ（3つのパラメータグループ）
     optimizer = AdamW([
         {'params': model.vit.parameters(), 'lr': config['learning_rate']},
-        {'params': head_params, 'lr': float(config.get('head_learning_rate', 1e-3))},
+        {'params': model.vggt.parameters(), 'lr': float(config.get('vggt_learning_rate', 2e-4))},
+        {'params': list(model.fusion.parameters()) + 
+                  list(model.decoder.parameters()) + 
+                  list(model.bev_head.parameters()) + 
+                  list(model.depth_head.parameters()), 
+         'lr': float(config.get('head_learning_rate', 1e-3))}
     ])
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=8, verbose=True)
-
-    # Train
+    
+    # Cosineスケジューラ
+    scheduler = CosineAnnealingLR(
+        optimizer, 
+        T_max=config['num_epochs'],
+        eta_min=float(config.get('min_learning_rate', 1e-7))
+    )
     patience, bad = 75, 0  # 密ターゲットなので少し長めに
     best_val = float('inf')  # 複合指標は大きい方が良いため
     scaler = torch.cuda.amp.GradScaler()
     
+    # 保存用の変数を追加
+    best_val = float('inf')
+    best_dice = 0.0
+    best_epoch = 0
+
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
         
@@ -394,8 +573,11 @@ def main(config_path, resume_from=None):
                 loss_dice_aux = soft_dice_loss(bev_pred, bev_bin)
                 loss_depth = criterion_depth(depth_pred, depth_tgt)
                 
-                total_loss = loss_bev_reg + bev_grad_weight * loss_bev_grad + \
-                           dice_loss_weight * loss_dice_aux + adaptive_depth_weight * loss_depth
+                warmup_factor = get_warmup_factor(epoch)
+                total_loss = loss_bev_reg + \
+                           warmup_factor * (bev_grad_weight * loss_bev_grad + \
+                                          dice_loss_weight * loss_dice_aux) + \
+                           adaptive_depth_weight * depth_shape_loss(bev_pred, depth_pred, bev_cont, depth_tgt)
                 # + physics_consistency_loss(bev_pred, depth_pred)  # 一旦コメントアウト
 
             scaler.scale(total_loss).backward()
@@ -437,44 +619,89 @@ def main(config_path, resume_from=None):
         avg_train = train_loss / max(1, len(train_loader))
         avg_val   = val_loss   / max(1, len(val_loader))
         avg_bev_r = val_bev_reg/ max(1, len(val_loader))
-        avg_bev_g = val_bev_grad/max(1, len(val_loader))
-        avg_dice  = val_dice   / max(1, len(val_loader))
-        avg_dep   = val_depth  / max(1, len(val_loader))
-        
+        avg_bev_g = val_bev_grad/ max(1, len(val_loader))
+        avg_depth = val_depth/ max(1, len(val_loader))
+        avg_dice  = val_dice/ max(1, len(val_loader))
         avg_dice_01 = dice_sum_01 / max(1, val_count)
         avg_dice_02 = dice_sum_02 / max(1, val_count)
         avg_dice_03 = dice_sum_03 / max(1, val_count)
 
-        print(f"Train Loss: {avg_train:.4f}, Val Loss: {avg_val:.4f}")
-        print(f"Val BEV(reg): {avg_bev_r:.4f}, BEV(grad): {avg_bev_g:.4f}, Dice: {avg_dice:.4f}, Depth: {avg_dep:.4f}")
-        print(f"Avg Dice@0.1: {avg_dice_01:.4f}, @0.2: {avg_dice_02:.4f}, @0.3: {avg_dice_03:.4f}")
-        print(f"Adaptive Depth Weight: {adaptive_depth_weight:.3f}")  # 追加
+        print(f"Train Loss: {avg_train:.4f}, Val Loss: {avg_val:.4f}, "
+              f"Val BEV Reg: {avg_bev_r:.4f}, Val BEV Grad: {avg_bev_g:.4f}, "
+              f"Val Depth: {avg_depth:.4f}, Val Dice: {avg_dice:.4f}, "
+              f"Dice@0.1: {avg_dice_01:.4f}, Dice@0.2: {avg_dice_02:.4f}, Dice@0.3: {avg_dice_03:.4f}")
 
-        # 深度統計も追加
-        with torch.no_grad():
-            depth_mean = depth_pred.mean().item()
-            depth_std = depth_pred.std().item()
-            print(f"Depth Stats: mean={depth_mean:.4f}, std={depth_std:.4f}")
+        # モデルの保存（複合指標を使用）
+        composite_metric = avg_dice_03 - 0.1 * avg_val  # Diceスコアを重視
+        if composite_metric > best_dice - 1e-4:  # 改善があれば保存
+            best_dice = composite_metric
+            best_epoch = epoch
+            
+            # チェックポイントの保存
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_dice': best_dice,
+                'best_val_loss': avg_val,
+                'config': config,
+                'metrics': {
+                    'dice_03': avg_dice_03,
+                    'val_loss': avg_val,
+                    'bev_reg': avg_bev_r,
+                    'bev_grad': avg_bev_g,
+                    'depth': avg_depth,
+                    'composite': composite_metric
+                }
+            }
+            
+            # ベストモデルの保存
+            torch.save(checkpoint, os.path.join(exp_dir, "best_model.pth"))
+            print(f"✨ New best model saved! (Epoch {epoch+1}, Dice@0.3: {avg_dice_03:.4f}, Val Loss: {avg_val:.4f})")
+            
+            # 最新のモデルも保存（リカバリ用）
+            torch.save(checkpoint, os.path.join(exp_dir, "latest_model.pth"))
 
-        scheduler.step(avg_val)
+        # 定期的なチェックポイント（10エポックごと）
+        if (epoch + 1) % 10 == 0:
+            checkpoint_path = os.path.join(exp_dir, f"checkpoint_epoch_{epoch+1}.pth")
+            torch.save(checkpoint, checkpoint_path)
+            print(f"📦 Checkpoint saved at epoch {epoch+1}")
 
-        # より賢い早期終了（371行目付近を変更）
-        # Val Lossでなく、複合指標で判断
-        composite_metric = avg_dice_03 - 0.05 * avg_val  # Dice重視、Loss軽視
-        print(f"  Bad epochs: {bad}/{patience}, Best val: {best_val:.4f}, Current: {avg_val:.4f}")
-        if avg_val < best_val - 1e-4:  # Val Lossは小さい方が良い
-            best_val = avg_val; bad = 0
-            torch.save(model.state_dict(), os.path.join(exp_dir, "best_model.pth"))
-            print(f"  -> Best model saved with Val Loss: {best_val:.4f}")
-        else:
-            bad += 1
-            # if bad >= patience: 
-            #     print("Early stop."); break
+        # Early stopping
+        if epoch - best_epoch > patience:
+            print(f"🛑 Early stopping triggered! No improvement for {patience} epochs")
+            break
+
+        # スケジューラのステップ
+        scheduler.step()
+
+    # 学習終了時の情報保存
+    final_info = {
+        'best_epoch': best_epoch,
+        'best_dice': best_dice,
+        'training_time': str(datetime.now() - start_time),
+        'final_metrics': {
+            'dice_03': avg_dice_03,
+            'val_loss': avg_val,
+            'composite': composite_metric
+        }
+    }
+    
+    # 学習情報をJSONで保存
+    import json
+    with open(os.path.join(exp_dir, 'training_info.json'), 'w') as f:
+        json.dump(final_info, f, indent=4)
+
+    print(f"\n🎉 Training completed!")
+    print(f"Best model was saved at epoch {best_epoch+1}")
+    print(f"Best Dice@0.3: {best_dice:.4f}")
 
 if __name__ == '__main__':
     if os.name == 'nt':
         torch.multiprocessing.freeze_support()
-    parser = argparse.ArgumentParser(description="PanoBEV-3D Training Script (Lung BEV)")
+    parser = argparse.ArgumentParser(description="PanoBEV-3D Training Script (Hybrid ViT+VGGT)")
     parser.add_argument('--config', type=str, default='config_lung.yaml', help="設定ファイルのパス")
     parser.add_argument('--resume_from', type=str, default=None, help="再開する実験ディレクトリパス")
     args = parser.parse_args()
