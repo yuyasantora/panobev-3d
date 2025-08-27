@@ -2,6 +2,7 @@ import os
 import SimpleITK as sitk
 import numpy as np
 import sys
+import yaml
 # モジュールのパスを追加
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -10,6 +11,7 @@ import drr_generator as drr_gen
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import warnings
+from sklearn.model_selection import train_test_split
 
 
 # --- 設定 --- 
@@ -65,9 +67,13 @@ def create_3d_voxel_grid(lung_mask_3d, output_size=(96, 96, 96)):
     voxel_grid = sitk.GetArrayFromImage(resampled_mask)
     return (voxel_grid > 0.5).astype(np.uint8)
 
-def process_patient(patient_id, config):
-    """一人の患者データに対して3Dボクセルの前処理を実行する"""
+def process_patient(patient_id, config, output_dir):
+    """一人の患者データに対して3Dボクセルの前処理を実行し、指定ディレクトリに保存する"""
     try:
+        # 保存先ディレクトリを構築
+        images_dir = os.path.join(output_dir, 'images')
+        targets_dir = os.path.join(output_dir, 'targets')
+
         original_image = drr_gen.find_best_ct_series(os.path.join(config['LIDC_IDRI_ROOT'], patient_id))
         if original_image is None: return f"No CT series for {patient_id}"
         
@@ -77,43 +83,75 @@ def process_patient(patient_id, config):
         lung_mask_3d = extract_lung_mask(ct_array)
         if lung_mask_3d.sum() < 1000: return f"Lung mask failed for {patient_id}"
 
-        # --- ここが変更点 ---
         # 3Dボクセルグリッドを生成
         voxel_target = create_3d_voxel_grid(lung_mask_3d, output_size=tuple(config['VOXEL_SIZE']))
         
         drr_images = drr_gen.create_drr_from_isotropic_ct(resampled_image, views=['AP', 'LAT', 'OBL'])
+
+        # ターゲットファイル名は患者IDごとに一意
+        target_filename = f"{patient_id}_voxel.npy"
+        target_path = os.path.join(targets_dir, target_filename)
+        # ターゲットは一度だけ保存
+        if not os.path.exists(target_path):
+            np.save(target_path, voxel_target)
 
         for view, drr_img_sitk in drr_images.items():
             drr_array = sitk.GetArrayFromImage(drr_img_sitk)
             
             # DRR画像（入力）
             image_filename = f"{patient_id}_{view}.npy"
-            np.save(os.path.join(config['OUTPUT_DIR'], 'images', image_filename), drr_array)
-
-            # 3Dボクセル（教師データ）
-            target_filename = f"{patient_id}_voxel.npy"
-            np.save(os.path.join(config['OUTPUT_DIR'], 'targets', target_filename), voxel_target)
+            np.save(os.path.join(images_dir, image_filename), drr_array)
             
         return f"Success: {patient_id}"
     except Exception as e:
         return f"Error on {patient_id}: {e}"
 
-def main():
-    with open('config_3d.yaml', 'r') as f:
-        config = yaml.safe_load(f)
-
-    os.makedirs(os.path.join(config['OUTPUT_DIR'], 'images'), exist_ok=True)
-    os.makedirs(os.path.join(config['OUTPUT_DIR'], 'targets'), exist_ok=True)
-    
-    patient_ids = [pid for pid in os.listdir(config['LIDC_IDRI_ROOT']) if pid.startswith('LIDC-IDRI-')]
-    print(f"Found {len(patient_ids)} patients.")
-
+def run_processing(patient_ids, config, output_dir, description):
+    """指定された患者IDリストのデータセット生成を実行するヘルパー関数"""
     with ProcessPoolExecutor(max_workers=os.cpu_count() - 1 or 1) as executor:
-        futures = {executor.submit(process_patient, pid, config): pid for pid in patient_ids}
-        with tqdm(total=len(patient_ids), desc="Processing Patients for 3D") as pbar:
+        futures = {executor.submit(process_patient, pid, config, output_dir): pid for pid in patient_ids}
+        with tqdm(total=len(patient_ids), desc=description) as pbar:
             for future in as_completed(futures):
                 pbar.set_postfix_str(future.result(), refresh=True)
                 pbar.update(1)
+
+def main():
+    config_path = os.path.join(current_dir, 'config_3d.yaml')
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+
+    # 1. 出力ディレクトリ構造を作成
+    base_output_dir = config['OUTPUT_DIR']
+    train_dir = os.path.join(base_output_dir, 'train')
+    val_dir = os.path.join(base_output_dir, 'val')
+
+    os.makedirs(os.path.join(train_dir, 'images'), exist_ok=True)
+    os.makedirs(os.path.join(train_dir, 'targets'), exist_ok=True)
+    os.makedirs(os.path.join(val_dir, 'images'), exist_ok=True)
+    os.makedirs(os.path.join(val_dir, 'targets'), exist_ok=True)
+    
+    # 2. 患者IDをリストアップし、訓練用と検証用に分割
+    all_patient_ids = [pid for pid in os.listdir(config['LIDC_IDRI_ROOT']) if pid.startswith('LIDC-IDRI-')]
+    print(f"Found {len(all_patient_ids)} total patients.")
+    
+    # configファイルから設定を読み込む（なければデフォルト値を使用）
+    val_split_size = config.get('VAL_SPLIT_SIZE', 0.2)
+    random_state = config.get('RANDOM_STATE', 42)
+
+    train_ids, val_ids = train_test_split(
+        all_patient_ids, 
+        test_size=val_split_size, 
+        random_state=random_state
+    )
+    print(f"Splitting into {len(train_ids)} training and {len(val_ids)} validation patients.")
+
+    # 3. 訓練データセットを生成
+    print("\n--- Generating Training Set ---")
+    run_processing(train_ids, config, train_dir, "Processing Train Set")
+
+    # 4. 検証データセットを生成
+    print("\n--- Generating Validation Set ---")
+    run_processing(val_ids, config, val_dir, "Processing Validation Set")
 
     print(f"\n3D Voxel dataset generation finished. Saved to: {config['OUTPUT_DIR']}")
 
