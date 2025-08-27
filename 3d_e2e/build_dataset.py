@@ -3,6 +3,7 @@ import SimpleITK as sitk
 import numpy as np
 import sys
 import yaml
+import scipy.ndimage # ★★★ インポートを追加 ★★★
 # モジュールのパスを追加
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -42,30 +43,37 @@ def extract_lung_mask(ct_array, hu_threshold=-500):
         final_mask = cleaned_mask
     return final_mask.astype(np.uint8)
 
+# ★★★ 関数を堅牢なscipyベースの実装に置き換え ★★★
 def create_3d_voxel_grid(lung_mask_3d, output_size=(96, 96, 96)):
     """
-    3D肺マスクを指定された解像度のボクセルグリッドにリサンプリングする。
+    3D肺マスクを指定された解像度のボクセルグリッドにリサンプリングする (scipy.ndimage.zoomを使用)。
     """
-    mask_sitk = sitk.GetImageFromArray(lung_mask_3d.astype(np.float32))
+    if lung_mask_3d.sum() == 0:
+        return np.zeros(output_size, dtype=np.uint8)
 
-    # 元の画像の情報を取得
-    mask_sitk.SetSpacing([sz * sp / nsz for sz, sp, nsz in zip(lung_mask_3d.shape[::-1], [1,1,1], output_size)])
-    mask_sitk.SetOrigin([0,0,0])
+    original_shape = lung_mask_3d.shape # (Z, Y, X)
+    
+    # ズーム率を計算
+    zoom_factors = (
+        output_size[0] / original_shape[0], 
+        output_size[1] / original_shape[1], 
+        output_size[2] / original_shape[2]
+    )
+    
+    # order=0は最近傍補間（Nearest Neighbor）を意味し、バイナリマスクに適している
+    resampled_mask = scipy.ndimage.zoom(lung_mask_3d, zoom_factors, order=0)
+    
+    # zoom後のサイズが指定と完全に一致しない場合があるため、最終的なサイズを保証する
+    final_grid = np.zeros(output_size, dtype=np.uint8)
+    
+    # 実際のサイズに合わせて切り取り/埋め込みを行う
+    z_lim = min(resampled_mask.shape[0], output_size[0])
+    y_lim = min(resampled_mask.shape[1], output_size[1])
+    x_lim = min(resampled_mask.shape[2], output_size[2])
+    
+    final_grid[:z_lim, :y_lim, :x_lim] = resampled_mask[:z_lim, :y_lim, :x_lim]
 
-    # ターゲットとなる参照画像を作成
-    ref_image = sitk.Image(output_size, sitk.sitkFloat32)
-    ref_image.SetSpacing([1,1,1])
-    ref_image.SetOrigin([0,0,0])
-
-    # リサンプリング
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetReferenceImage(ref_image)
-    resampler.SetInterpolator(sitk.sitkNearestNeighbor) # バイナリマスクなので最近傍法
-
-    resampled_mask = resampler.Execute(mask_sitk)
-
-    voxel_grid = sitk.GetArrayFromImage(resampled_mask)
-    return (voxel_grid > 0.5).astype(np.uint8)
+    return final_grid
 
 def process_patient(patient_id, config, output_dir):
     """一人の患者データに対して3Dボクセルの前処理を実行し、指定ディレクトリに保存する"""
@@ -81,11 +89,25 @@ def process_patient(patient_id, config, output_dir):
         ct_array = sitk.GetArrayFromImage(resampled_image)
 
         lung_mask_3d = extract_lung_mask(ct_array)
-        if lung_mask_3d.sum() < 1000: return f"Lung mask failed for {patient_id}"
+        
+        # ★★★ デバッグログを追加(1): マスク抽出後のボクセル数を確認 ★★★
+        mask_sum_before = lung_mask_3d.sum()
+        print(f"-> ID: {patient_id}, Mask sum BEFORE resampling: {mask_sum_before}")
+
+        if mask_sum_before < 1000:
+            return f"Mask too small for {patient_id}, skipping."
 
         # 3Dボクセルグリッドを生成
         voxel_target = create_3d_voxel_grid(lung_mask_3d, output_size=tuple(config['VOXEL_SIZE']))
         
+        # ★★★ デバッグログを追加(2): リサンプリング後のボクセル数を確認 ★★★
+        mask_sum_after = voxel_target.sum()
+        print(f"-> ID: {patient_id}, Voxel grid sum AFTER resampling: {mask_sum_after}")
+
+        # ★★★ ボクセルが空の場合は、エラーとしてデータを保存せずにスキップ ★★★
+        if mask_sum_after == 0:
+            return f"EMPTY voxel grid for {patient_id}, skipping."
+
         drr_images = drr_gen.create_drr_from_isotropic_ct(resampled_image, views=['AP', 'LAT', 'OBL'])
 
         # ターゲットファイル名は患者IDごとに一意
