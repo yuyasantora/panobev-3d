@@ -3,7 +3,7 @@ data/
 dataset/
 dataset_lung/
 dataset_lung_multislice/
-plan_b_3d/dataset_lung_3d/
+3d_e2e/dataset_lung_3d/
 experiments_lung/
 experiments_multislice/
 experiments_3d/

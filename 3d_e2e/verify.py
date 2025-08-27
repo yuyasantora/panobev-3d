@@ -4,38 +4,45 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import random
+import glob
 
 def visualize_sample(dataset_dir):
     """
-    データセットからランダムにサンプルを1つ選び、DRR画像と3Dボクセルを可視化する。
+    データセットからランダムに"成功した"サンプルを1つ選び、DRR画像と3Dボクセルを可視化する。
     """
-    # ★★★★★ 修正点 1: 'train' サブディレクトリを見るようにパスを修正 ★★★★★
     data_subset_to_verify = 'train' 
     images_dir = os.path.join(dataset_dir, data_subset_to_verify, 'images')
     targets_dir = os.path.join(dataset_dir, data_subset_to_verify, 'targets')
 
-    if not os.path.exists(images_dir) or not os.listdir(images_dir):
-        print(f"エラー: 画像ディレクトリが見つからないか、空です: {images_dir}")
-        print("ヒント: build_dataset.py を実行して、データセットが正しく生成されているか確認してください。")
+    if not os.path.exists(targets_dir) or not os.listdir(targets_dir):
+        print(f"エラー: ターゲットディレクトリが見つからないか、空です: {targets_dir}")
+        print("ヒント: build_dataset.py を実行して、データセットを生成してください。")
         return
 
-    # 1. ランダムな画像ファイルを選択
-    random_image_name = random.choice(os.listdir(images_dir))
-    image_path = os.path.join(images_dir, random_image_name)
+    # ★★★★★ 修正点: ターゲットからランダムに選択 ★★★★★
+    # 1. ランダムなターゲットファイルを選択 (これは成功が保証されている)
+    random_target_name = random.choice(os.listdir(targets_dir))
+    target_path = os.path.join(targets_dir, random_target_name)
 
-    # ★★★★★ 修正点 2: 患者IDの抽出をより堅牢な方法に修正 ★★★★★
-    # 例: "LIDC-IDRI-0001_AP.npy" -> "LIDC-IDRI-0001"
-    #     ファイル名の最後の'_'より前をすべて取得します。
-    patient_id = random_image_name.rsplit('_', 1)[0]
-    target_name = f"{patient_id}_voxel.npy"
-    target_path = os.path.join(targets_dir, target_name)
-
-    if not os.path.exists(target_path):
-        print(f"エラー: 対応するターゲットファイルが見つかりません: {target_path}")
+    # 2. 対応する画像ファイルを見つける
+    # 例: "LIDC-IDRI-0001_voxel.npy" -> "LIDC-IDRI-0001"
+    patient_id = random_target_name.replace('_voxel.npy', '')
+    
+    # この患者IDに一致するDRR画像を探す (AP, LAT, OBLのいずれか)
+    # globを使ってワイルドカード検索
+    possible_images = glob.glob(os.path.join(images_dir, f"{patient_id}_*.npy"))
+    
+    if not possible_images:
+        print(f"エラー: 対応する画像ファイルが見つかりません: {patient_id}_*.npy")
         return
+    
+    # 見つかった画像の中からランダムに1つ選ぶ
+    image_path = random.choice(possible_images)
+    image_name = os.path.basename(image_path)
+
 
     # 3. データを読み込む
-    print(f"読み込み中:\n  - 画像: {random_image_name}\n  - ターゲット: {target_name}")
+    print(f"読み込み中:\n  - 画像: {image_name}\n  - ターゲット: {random_target_name}")
     drr_image = np.load(image_path)
     voxel_grid = np.load(target_path)
 
@@ -45,7 +52,7 @@ def visualize_sample(dataset_dir):
     # 左側: DRR画像
     ax1 = fig.add_subplot(1, 2, 1)
     ax1.imshow(drr_image, cmap='gray')
-    ax1.set_title(f"Input DRR Image\n{random_image_name}")
+    ax1.set_title(f"Input DRR Image\n{image_name}")
     ax1.axis('off')
 
     # 右側: 3Dボクセルデータ
