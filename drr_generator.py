@@ -103,10 +103,32 @@ def create_drr_from_isotropic_ct(resampled_image, views=['AP']):
         # spacing[1]はY軸（視線方向）のピクセルの厚み
         drr_array = np.exp(-drr_array * spacing[1]) 
         
-        # [0, 255]の範囲に正規化
-        min_val, max_val = drr_array.min(), drr_array.max()
+        # ★★★★★ 修正箇所: 通常の正規化をウィンドウ処理に置き換える ★★★★★
+        # 胸部X線写真に適したウィンドウレベルと幅（経験的な値）
+        # ウィンドウレベル(WL): 関心領域の中心輝度
+        # ウィンドウ幅(WW): 表示する輝度の範囲
+        window_level = 0.7  # 0.0(黒)から1.0(白)の範囲で調整
+        window_width = 0.5  # 0.0から1.0の範囲で調整
+
+        # [0, 1]の範囲にクリップ（はみ出した値を丸める）
+        min_val = drr_array.min()
+        max_val = drr_array.max()
         if max_val > min_val:
-            drr_array = 255 * (drr_array - min_val) / (max_val - min_val)
+            drr_array = (drr_array - min_val) / (max_val - min_val)
+        
+        # ウィンドウ処理を適用
+        min_window = window_level - window_width / 2
+        max_window = window_level + window_width / 2
+        
+        drr_array[drr_array < min_window] = min_window
+        drr_array[drr_array > max_window] = max_window
+
+        # ウィンドウ範囲を[0, 255]に再スケーリング
+        if (max_window - min_window) > 0:
+            drr_array = 255 * (drr_array - min_window) / (max_window - min_window)
+        else: # ゼロ除算を避ける
+            drr_array.fill(0)
+        # ★★★★★ 修正ここまで ★★★★★
         
         drr_image_sitk = sitk.GetImageFromArray(drr_array.astype(np.uint8))
         drr_images[view] = drr_image_sitk
