@@ -1,0 +1,13 @@
+# config_3d.yaml - for Plan B (Full 3D Voxel Prediction)
+
+# --- Paths ---
+# !!! このパスはご自身の環境に合わせて確認・修正してください !!!
+LIDC_IDRI_ROOT: '../data/manifest-1752629384107/LIDC-IDRI/'
+
+# 出力先ディレクトリ (plan_b_3d/dataset_lung_3d/ に作られます)
+OUTPUT_DIR: 'dataset_lung_3d' 
+
+# --- Target Voxel Grid Settings ---
+# 3Dモデルの教師データの解像度
+# 20GBのVRAM環境での学習を想定し、96x96x96から始めるのが安全
+VOXEL_SIZE: [96, 96, 96]

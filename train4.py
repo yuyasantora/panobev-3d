@@ -553,6 +553,7 @@ def main(config_path, resume_from=None):
     best_dice = 0.0
     best_epoch = 0
 
+    start_time = datetime.now()
     for epoch in range(config['num_epochs']):
         print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
         

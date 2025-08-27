@@ -1,0 +1,19 @@
+# config_multislice.yaml
+data_dir: "dataset_lung_multislice" # build_dataset_multislice.py で生成したデータセット
+output_dir: 'experiments_multislice'
+
+# --- Dataset & Model Settings ---
+resize_shape: [224, 224]
+num_bev_slices: 16 # データセット生成時と合わせる
+
+# --- Dataloader Settings ---
+batch_size: 4
+num_workers: 2
+
+# --- Model Settings ---
+vit_model_name: 'google/vit-base-patch16-224-in21k'
+
+# --- Training Settings ---
+num_epochs: 150
+learning_rate: 0.0001 # 1e-4
+seed: 42 
